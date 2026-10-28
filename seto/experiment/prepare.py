@@ -25,6 +25,7 @@ from ..data import features as features_mod
 from ..data import grid as grid_mod
 from ..data import osm_layers as layers_mod
 from ..data import population as population_mod
+from ..data import registry as registry_mod
 from ..routing import graph as graph_mod
 from ..routing import matrix as matrix_mod
 from ..sites import feasible as sites_mod
@@ -84,6 +85,41 @@ def _state_clinics(medical: gpd.GeoDataFrame, cfg: dict):
     return selection.frame.reset_index(drop=True), selection
 
 
+# что записать в отчёт о том, откуда взята сеть
+_NETWORK_SOURCES = {
+    "osm_names": "государственные взрослые ПМСП по названию — реестра нет (Л7)",
+    "registry": "государственная сеть из официального реестра",
+}
+
+
+def _base_network(cfg: dict, raw: Path, points: gpd.GeoDataFrame,
+                  polygons: gpd.GeoDataFrame, crs):
+    """Базовая сеть города: из реестра или из OSM по названию.
+
+    Источник задаёт конфиг (`base_network.source`, по умолчанию osm_names —
+    так у Москвы и Люцерна). Возвращает (сеть, отбор, число кандидатов):
+    у реестра кандидаты — учреждения города, у OSM — его медобъекты."""
+    source = settings.setting(cfg, "base_network").get("source", "osm_names")
+    if source not in _NETWORK_SOURCES:
+        raise settings.ConfigError(
+            f"base_network.source должен быть одним из {list(_NETWORK_SOURCES)}, "
+            f"а не {source!r}")
+
+    if source == "registry":
+        rules = cfg["city"]["registry"]
+        path = raw / cfg["city"]["sources"]["tables"][rules["table"]]["file"]
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"нет реестра {path}. Сначала `python -m seto acquire {cfg['city']['name']}`")
+        selection = registry_mod.load(path, rules)
+        return selection.frame.reset_index().to_crs(crs), selection, selection.candidates
+
+    medical = layers_mod.medical_facilities(
+        points, polygons, cfg["osm"]["clinic_tags"]).to_crs(crs)
+    clinics, selection = _state_clinics(medical, cfg)
+    return clinics, selection, len(medical)
+
+
 def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                  costs: CostLog | None = None) -> CityData:
     """Собрать все общие данные города."""
@@ -135,15 +171,14 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         say("признаки", columns=len(features.columns))
 
     with costs.stage("clinics", SHARED) as extra:
-        medical = layers_mod.medical_facilities(
-            points, layers["poi_polygons"], cfg["osm"]["clinic_tags"]).to_crs(crs)
-        clinics, selection = _state_clinics(medical, cfg)
-        extra.update({"candidates": len(medical), "state_proxy": len(clinics),
+        clinics, selection, candidates = _base_network(
+            cfg, raw, points, layers["poi_polygons"], crs)
+        extra.update({"candidates": candidates, "state_proxy": len(clinics),
                       **selection.as_dict()})
-        say("поликлиники", candidates=len(medical), state=len(clinics),
+        say("поликлиники", candidates=candidates, state=len(clinics),
             uncertain=len(selection.uncertain))
-        # прошли фильтр, но название нетиповое — список нужен человеку (Л9),
-        # одного счётчика в отчёте для проверки мало
+        # то, что нужно человеку: у OSM — нетиповые названия (Л9), у реестра —
+        # центры без координат; одного счётчика в отчёте для проверки мало
         _save_uncertain(selection.uncertain, out_dir / "clinics_uncertain.csv")
 
     with costs.stage("graph", SHARED) as extra:
@@ -205,9 +240,9 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         "grid": grid_mod.grid_summary(grid),
         "population": transfer.as_dict(),
         "osm": layers_mod.completeness_report(layers["buildings"], roads, points),
-        "clinics": {"candidates": len(medical), "state_proxy": len(clinics),
-                    "selection": ("государственные взрослые ПМСП по названию — "
-                                  "реестра нет (Л7)"),
+        "clinics": {"candidates": candidates, "state_proxy": len(clinics),
+                    "selection": _NETWORK_SOURCES[
+                        settings.setting(cfg, "base_network").get("source", "osm_names")],
                     **selection.as_dict()},
         "graph": {"nodes": graph.node_count, "edges": graph.edge_count,
                   "dropped_nodes": graph.dropped_nodes},
