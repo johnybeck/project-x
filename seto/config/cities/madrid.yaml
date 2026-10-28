@@ -30,6 +30,36 @@ sources:
   population_raster:
     url: "https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/GHSL/GHS_POP_GLOBE_R2023A/GHS_POP_E2025_GLOBE_R2023A_54009_100/V1-0/tiles/GHS_POP_E2025_GLOBE_R2023A_54009_100_V1_0_R5_C18.zip"
     license: "CC BY 4.0, European Commission JRC (GHSL)"
+  # Табличные источники пропозала v2 (п. 3.8). Проверены в docs/MADRID_DATA.md.
+  # file — имя в raw/<город>/<срез>/; хеши пишутся в data_manifest.json.
+  tables:
+    # Реестр центров здоровья. Истории у файла нет: каталог обновляет его на
+    # месте, поэтому версия — это только хеш в манифесте на дату загрузки.
+    clinics_registry:
+      url: "https://datos.comunidad.madrid/dataset/d8a0a444-adf5-4c04-8999-0eac3de52cb7/resource/2948b4da-8b39-42b7-b667-779a5284f39d/download/centros_servicios_establecimientos_sanitarios.csv"
+      file: "clinics_registry.csv"
+      license: "CC BY 4.0, Comunidad de Madrid"
+      note: "Centros, servicios y establecimientos sanitarios; координаты ETRS89 / UTM 30N"
+    # Население по участкам и возрасту по одному году на 01.01.2024 — срез,
+    # совпадающий с границами Secciones_2024 (2450 из 2450).
+    padron:
+      url: "https://datos.madrid.es/dataset/209163-0-padron-municipal-historico/resource/209163-202-padron-municipal-historico-csv/download/209163-202-padron-municipal-historico-csv.csv"
+      file: "padron_2024_01.csv"
+      license: "CC BY 4.0, Ayuntamiento de Madrid"
+      note: "Padrón municipal. Histórico. 2024. Enero"
+    # Границы участков Мадрида. API отдаёт постранично; limit с запасом, а
+    # полноту проверяет загрузчик (numberMatched = numberReturned).
+    sections:
+      url: "https://www.ine.es/geoserver/ogc/features/v1/collections/WMS_INE_SECCIONES_G01:Secciones_2024/items?f=json&limit=5000&filter=CUMUN%3D%2728079%27&filter-lang=cql-text"
+      file: "sections_2024.geojson"
+      license: "CC BY 4.0, INE"
+      note: "Secciones_2024, муниципалитет 28079, EPSG:4326"
+    # Доход по участкам (эталон М4 и частного сценария), вся провинция, все годы.
+    income:
+      url: "https://www.ine.es/jaxiT3/files/t/es/csv_bdsc/31097.csv"
+      file: "adrh_31097_income.csv"
+      license: "INE, открытые данные"
+      note: "ADRH, табл. 31097 «Indicadores de renta media y mediana»"
 
 # ВРЕМЕННО, до задачи 2.3 (сеть из реестра, docs/TODO_V2.md): правила
 # глобального конфига написаны под русские названия и в Мадриде не найдут

@@ -155,6 +155,19 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             run.record_input(raster.path)
             sources.append(raster)
 
+        # Табличные источники (реестр, падрон, участки, доход) — пока только
+        # у Мадрида; у городов без раздела tables ничего не меняется.
+        tables_cfg = sources_cfg.get("tables") or {}
+        if tables_cfg:
+            from .acquire.download import fetch_tables
+
+            for table in fetch_tables(tables_cfg, raw, overwrite=args.overwrite):
+                logger.info("таблица", name=table.name,
+                            size_mb=round(table.size_bytes / (1 << 20), 1),
+                            sha256=table.sha256[:16])
+                run.record_input(table.path)
+                sources.append(table)
+
         manifest = write_data_manifest(sources, raw / "data_manifest.json",
                                        snapshot, notes={"layers": layers})
         run.record_output(manifest)

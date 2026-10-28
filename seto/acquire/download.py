@@ -31,6 +31,7 @@ class Source:
     downloaded_at: str
     last_modified: str | None = None
     license: str | None = None
+    note: str | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -135,6 +136,42 @@ def write_data_manifest(sources: list[Source], path: Path,
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return path
+
+
+def fetch_tables(entries: dict, raw: Path, overwrite: bool = False) -> list[Source]:
+    """Скачать табличные источники города (реестр, падрон, участки, доход).
+
+    entries — раздел `sources.tables` конфига города: имя -> {url, file,
+    license, note}. Имя файла задаёт конфиг, а не URL: у API и каталогов
+    ссылки вида `items?f=json&...`, из них имени не вывести."""
+    sources = []
+    for name, entry in entries.items():
+        for key in ("url", "file"):
+            if not entry.get(key):
+                raise DownloadError(f"sources.tables.{name}: не задано поле {key}")
+        target = raw / entry["file"]
+        source = fetch(entry["url"], target, name=name,
+                       license_note=entry.get("license"), overwrite=overwrite)
+        if target.suffix.lower() in (".geojson", ".json"):
+            _check_complete(target, name)
+        source.note = entry.get("note")
+        sources.append(source)
+    return sources
+
+
+def _check_complete(path: Path, name: str) -> None:
+    """Проверить, что API отдал ВСЕ объекты, а не первую страницу.
+
+    OGC API Features отдаёт выдачу постранично. Если limit меньше числа
+    объектов, файл скачается без ошибки, но без части участков — и это
+    всплыло бы только как «пропавшее» население где-то посреди расчёта."""
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    matched, returned = data.get("numberMatched"), data.get("numberReturned")
+    if matched is not None and returned is not None and returned < matched:
+        raise DownloadError(
+            f"{name}: API вернул {returned} объектов из {matched} — "
+            "увеличь limit в URL или качай постранично")
 
 
 def fetch_population_raster(url: str, raw: Path, license_note: str | None = None,

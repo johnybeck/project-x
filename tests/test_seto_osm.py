@@ -125,6 +125,53 @@ def test_download_error_on_bad_url(tmp_path):
               name="x", progress=False)
 
 
+def _local(tmp_path, name: str, text: str) -> str:
+    """Файл-источник на диске и его file:// ссылка — сеть в тестах не нужна."""
+    path = tmp_path / "remote" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path.as_uri()
+
+
+def test_fetch_tables_saves_under_config_names(tmp_path):
+    """Имя файла задаёт конфиг: у API ссылки вида items?f=json, имени в них нет."""
+    from seto.acquire.download import fetch_tables
+
+    entries = {
+        "padron": {"url": _local(tmp_path, "x.csv", "a;b\n1;2\n"),
+                   "file": "padron.csv", "license": "CC BY 4.0",
+                   "note": "2024. Enero"},
+        "sections": {"url": _local(tmp_path, "items", '{"type": "FeatureCollection", '
+                                   '"features": [], "numberMatched": 2, '
+                                   '"numberReturned": 2}'),
+                     "file": "sections.geojson"},
+    }
+    raw = tmp_path / "raw"
+    sources = fetch_tables(entries, raw)
+    assert [s.name for s in sources] == ["padron", "sections"]
+    assert (raw / "padron.csv").read_text(encoding="utf-8") == "a;b\n1;2\n"
+    assert sources[0].license == "CC BY 4.0" and sources[0].note == "2024. Enero"
+    assert sources[1].note is None
+
+
+def test_fetch_tables_refuses_truncated_api_page(tmp_path):
+    """Первая страница выдачи вместо всех участков — ошибка, а не тихий пропуск."""
+    from seto.acquire.download import DownloadError, fetch_tables
+
+    url = _local(tmp_path, "items", '{"features": [], "numberMatched": 2471, '
+                 '"numberReturned": 1000}')
+    with pytest.raises(DownloadError, match="1000 объектов из 2471"):
+        fetch_tables({"sections": {"url": url, "file": "s.geojson"}}, tmp_path / "raw")
+
+
+def test_fetch_tables_requires_file_name(tmp_path):
+    from seto.acquire.download import DownloadError, fetch_tables
+
+    with pytest.raises(DownloadError, match="file"):
+        fetch_tables({"padron": {"url": _local(tmp_path, "x.csv", "1")}},
+                     tmp_path / "raw")
+
+
 def test_data_manifest_has_hashes(tmp_path):
     from seto.acquire.download import Source, write_data_manifest
     import json
