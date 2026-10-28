@@ -325,6 +325,16 @@ def test_swap_fails_loudly_when_k_sites_cannot_be_separated():
         SV.solve_pmedian_swap(site_times, base, weights, allowed, k=2)
 
 
+def test_one_entry_point_picks_solver_by_k():
+    """k ≤ 2 — точный перебор, k > 2 — обмен; варианты решаются одним путём."""
+    site_times, base, weights, allowed = _random_city(5)
+    cfg = {"seed": 0, "swap_heuristic": {"starts": 5, "max_iterations": 100}}
+    exact = SV.solve_pmedian_any(site_times, base, weights, allowed, 2, "B", cfg)
+    swap = SV.solve_pmedian_any(site_times, base, weights, allowed, 4, "B", cfg)
+    assert exact.spread is None and exact.evaluated > 0
+    assert swap.spread["starts"] == 5 and len(swap.sites) == 4
+
+
 def test_built_from_can_be_overridden_per_city():
     """Там, где тип здания в OSM почти не проставлен, застройку считают по
     всем зданиям: в Люцерне тип есть у 26 % против 56 % в Москве."""

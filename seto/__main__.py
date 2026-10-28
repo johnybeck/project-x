@@ -434,6 +434,11 @@ def _load_city_data(run_dir: Path):
         clinics_table,
         geometry=gpd.points_from_xy(clinics_table["lon"], clinics_table["lat"]),
         crs="EPSG:4326").to_crs(grid.crs)
+    from .data.demography import cell_groups
+
+    # возрастные группы лежат в cell_features колонками pop_*; без них BN
+    # при повторном расчёте стал бы «нет данных», хотя данные есть
+    groups = cell_groups(features)
     return CityData(
         grid=grid,
         features=features.drop(columns=["population"], errors="ignore"),
@@ -441,7 +446,8 @@ def _load_city_data(run_dir: Path):
         clinics=clinics,
         base_times=times["base"], clinic_times=times["clinics"],
         site_times=times["sites"], site_index=times["site_index"],
-        allowed_pairs=times["allowed"], report={})
+        allowed_pairs=times["allowed"], report={},
+        groups=groups if len(groups.columns) else None)
 
 
 def cmd_sensitivity(args: argparse.Namespace) -> int:

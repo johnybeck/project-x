@@ -100,6 +100,45 @@ def test_scores_change_the_choice(city, cfg):
     assert by_name["C"].sites
 
 
+# --- вариант BN (задача 4.2 TODO_V2) ---
+
+NEED_CITY = {"role": "dev", "name": "test",
+             "demography": {"groups": {"adults_18_64": [18, 64],
+                                       "seniors_65": [65, None]}},
+             "need": {"r": 2.0, "main": "age",
+                      "definitions": {"age": {"adults_18_64": 1, "seniors_65": "r"}}}}
+
+
+def _with_groups(city, adults, seniors):
+    city.groups = pd.DataFrame({"adults_18_64": adults, "seniors_65": seniors})
+    return city
+
+
+def test_bn_without_age_data_is_marked_not_computed(city, cfg):
+    """Нет возрастных групп (Москва) — BN «нет данных», а не копия B."""
+    by_name = {v.name: v for v in run_variants(city, {}, cfg).variants}
+    assert by_name["BN"].status == "missing_external" and not by_name["BN"].sites
+
+
+def test_bn_follows_need_not_population(city, cfg):
+    """Пожилые живут в мелких клетках 2 и 3 — BN тянется туда, B нет."""
+    _with_groups(city, adults=[100.0, 0, 0, 0], seniors=[0, 0, 500.0, 500.0])
+    result = run_variants(city, {}, {**cfg, "city": NEED_CITY})
+    by_name = {v.name: v for v in result.variants}
+    assert by_name["B"].sites == (0, 1)
+    assert by_name["BN"].sites == (0, 2) and by_name["BN"].status == "ok"
+    assert "BN − B" in result.differences["pair"].tolist()
+
+
+def test_bn_equal_to_b_is_a_result_not_a_duplicate(city, cfg):
+    """BN совпал с B — это ответ «потолок М2 = 0», он не отбрасывается."""
+    _with_groups(city, adults=city.population.copy(), seniors=np.zeros(4))
+    by_name = {v.name: v for v in run_variants(
+        city, {}, {**cfg, "city": NEED_CITY}).variants}
+    assert by_name["BN"].sites == by_name["B"].sites
+    assert by_name["BN"].status == "ok" and "совпало с B" in by_name["BN"].note
+
+
 def test_identical_solution_marked_as_duplicate(city, cfg):
     """Правило «C ≈ B»: совпало с B — дубликат не считается (п. 9)."""
     scores = np.zeros(4)                            # скор ничего не меняет

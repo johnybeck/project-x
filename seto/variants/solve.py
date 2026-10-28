@@ -215,6 +215,23 @@ def solve_pmedian_swap(site_times: np.ndarray, base_times: np.ndarray,
                     tie_count=len(set(winners)) - 1, spread=spread)
 
 
+def solve_pmedian_any(site_times: np.ndarray, base_times: np.ndarray,
+                      weights: np.ndarray, allowed: np.ndarray, k: int,
+                      variant: str, cfg: dict) -> Solution:
+    """P-median при любом k: при k ≤ 2 — полный перебор (точный оптимум),
+    иначе — эвристика обмена с параметрами из `swap_heuristic` конфига.
+
+    Одна точка входа для B, BN, C, D: варианты обязаны решаться одним и тем
+    же решателем, иначе разница между ними мерила бы и разницу решателей."""
+    if k <= 2:
+        return solve_pmedian(site_times, base_times, weights, allowed, k, variant)
+    params = cfg.get("swap_heuristic") or {}
+    return solve_pmedian_swap(site_times, base_times, weights, allowed, k, variant,
+                              starts=params.get("starts", 20),
+                              seed=cfg.get("seed", 0),
+                              max_iterations=params.get("max_iterations", 1000))
+
+
 def solve_max_coverage(site_times: np.ndarray, base_times: np.ndarray,
                        population: np.ndarray, allowed: np.ndarray, k: int,
                        threshold: float) -> Solution:

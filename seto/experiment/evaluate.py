@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ..costs.timer import CostLog
+from ..data import demography as demography_mod
 from ..metrics import coverage as cov
 from ..metrics import sfca
 from ..scoring import weights as weights_mod
@@ -63,6 +64,22 @@ def _metrics_row(name: str, times: np.ndarray, base: np.ndarray,
     return row
 
 
+def need_weights(data, cfg: dict) -> np.ndarray | None:
+    """Нуждаемость N_i по основному определению (пропозал v2, п. 3.3).
+
+    None, если у города нет возрастных групп или раздела need: тогда вариант
+    BN помечается «нет данных», а не считается на всём населении — иначе BN
+    молча совпал бы с B, и потолок М2 оказался бы нулём по построению."""
+    city = cfg.get("city") or {}
+    groups = getattr(data, "groups", None)
+    if groups is None or "need" not in city:
+        return None
+    rules = city["need"]
+    need = demography_mod.need(groups, rules["definitions"][rules["main"]],
+                               rules["r"], city["demography"]["groups"])
+    return need.to_numpy(dtype=float)
+
+
 def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
                  costs: CostLog | None = None, logger=None) -> Evaluation:
     """Решить A, B, M, C, D и посчитать метрики. scores — скоры по вариантам."""
@@ -81,10 +98,31 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
 
     # --- B: p-median по населению ---
     with costs.stage("solve", "variant:B"):
-        solution = solver.solve_pmedian(site_times, base, base_weights, allowed, k, "B")
+        solution = solver.solve_pmedian_any(site_times, base, base_weights, allowed,
+                                            k, "B", cfg)
     results.append(VariantResult("B", solution.sites, objective=solution.objective,
                                  tie_count=solution.tie_count))
     say("вариант B", sites=list(solution.sites), ties=solution.tie_count)
+
+    # --- BN: p-median по нуждаемости — эталон для М2 (пропозал v2, п. 3.4) ---
+    need = need_weights(data, cfg)
+    if need is None:
+        results.append(VariantResult(
+            "BN", (), status="missing_external",
+            note="нет нуждаемости: у города нет возрастных групп или раздела need"))
+    else:
+        with costs.stage("solve", "variant:BN"):
+            solution = solver.solve_pmedian_any(site_times, base, need, allowed,
+                                                k, "BN", cfg)
+        comparison = weights_mod.compare(base_weights, need)
+        # совпадение с B здесь — результат (потолок М2 = 0), а не дубликат
+        same_as_b = solution.sites == results[0].sites
+        results.append(VariantResult(
+            "BN", solution.sites, objective=solution.objective,
+            tie_count=solution.tie_count,
+            note=(("решение совпало с B; " if same_as_b else "")
+                  + f"корреляция весов с B {comparison['correlation']:.4f}")))
+        say("вариант BN", sites=list(solution.sites), same_as_b=same_as_b)
 
     # --- M: максимальное покрытие ---
     with costs.stage("solve", "variant:M"):
@@ -102,7 +140,8 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
             continue
         with costs.stage("solve", f"variant:{name}"):
             weights = weights_mod.demand(population, scores[key], cfg["alpha"])
-            solution = solver.solve_pmedian(site_times, base, weights, allowed, k, name)
+            solution = solver.solve_pmedian_any(site_times, base, weights, allowed,
+                                                k, name, cfg)
         comparison = weights_mod.compare(base_weights, weights)
         # п. 9: если решение совпало с B, дубликат не считается
         same_as_b = solution.sites == results[0].sites
@@ -154,7 +193,8 @@ def _facility_times(data, sites) -> np.ndarray:
     return np.vstack([existing, data.site_times[list(sites)]])
 
 
-_PAIR_ORDER = ("D", "C", "B", "E", "M")
+# BN стоит перед B: пропозал v2 (п. 3.4) читает разницу как BN − B
+_PAIR_ORDER = ("D", "C", "BN", "B", "E", "M")
 
 
 def _differences(table: pd.DataFrame, results: list[VariantResult],
