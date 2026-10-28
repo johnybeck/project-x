@@ -61,6 +61,32 @@ sources:
       license: "INE, открытые данные"
       note: "ADRH, табл. 31097 «Indicadores de renta media y mediana»"
 
+# Базовая сеть из реестра (пропозал v2, п. 3.2: центры здоровья — взрослая
+# первичная помощь государственной сети). Правила — здесь, чтобы их можно было
+# оспорить и пересчитать; разбор полей — docs/MADRID_DATA.md, п. 2.
+# В расчёт подключается в задаче 2.3; до тех пор prepare-city берёт сеть из OSM.
+registry:
+  table: clinics_registry          # имя из sources.tables
+  sep: ";"
+  encoding: "utf-8"
+  id_column: centro_nro_registro   # одна строка файла — учреждение × услуга
+  x_column: localizacion_coordenada_x
+  y_column: localizacion_coordenada_y
+  crs: 25830                       # ETRS89 / UTM 30N — проверено геокодированием
+  # Кто вообще кандидат: учреждения муниципалитета Мадрид.
+  scope:
+    column: municipio_nombre
+    values: ["Madrid"]
+  # Правила по порядку: учреждение исключается первым правилом, которому
+  # не соответствует, и это правило пишется в отчёт.
+  require:
+    "не первичная помощь":
+      column: centro_tipo
+      values: ["Centro de salud", "Consultorio de atención primaria"]
+    "не государственная сеть региона":
+      column: dependecia_funcional
+      values: ["Servicios o Institutos de Salud de las CC.AA"]
+
 # ВРЕМЕННО, до задачи 2.3 (сеть из реестра, docs/TODO_V2.md): правила
 # глобального конфига написаны под русские названия и в Мадриде не найдут
 # ничего. Пока сеть — все медобъекты OSM по тегам, как в Люцерне; этого
