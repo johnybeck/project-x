@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -127,6 +128,72 @@ def boundaries(path: Path, rules: dict, crs) -> "gpd.GeoDataFrame":
         frame = frame[frame[key] != value]
     frame = frame.rename(columns={rules["code_column"]: "code"})
     return frame[["code", "geometry"]].to_crs(crs).reset_index(drop=True)
+
+
+# --- нуждаемость N_i (пропозал v2, п. 3.3) ---
+
+def weight(value, r: float) -> float:
+    """Вес группы в определении нуждаемости: число или кратное r ("r", "2r").
+
+    Кратное r пишется словом, а не готовым числом: иначе при правке r
+    удвоенное r осталось бы старым, и проверка устойчивости мерила бы не то."""
+    if isinstance(value, (int, float)):
+        result = float(value)
+    else:
+        found = re.fullmatch(r"\s*(\d*\.?\d*)\s*r\s*", str(value))
+        if not found:
+            raise ValueError(f"вес {value!r}: ожидалось число или кратное r ('r', '2r')")
+        result = (float(found.group(1)) if found.group(1) else 1.0) * r
+    if result < 0:
+        raise ValueError(f"вес {value!r} отрицательный")
+    return result
+
+
+def _overlapping(groups: dict, names: list[str]) -> list[tuple[str, str]]:
+    """Пары групп определения, у которых пересекаются возрасты."""
+    pairs = []
+    for i, first in enumerate(names):
+        for second in names[i + 1:]:
+            low_a, high_a = groups[first]
+            low_b, high_b = groups[second]
+            if low_a <= (high_b if high_b is not None else float("inf")) and \
+                    low_b <= (high_a if high_a is not None else float("inf")):
+                pairs.append((first, second))
+    return pairs
+
+
+def need(people: pd.DataFrame, definition: dict, r: float, groups: dict) -> pd.Series:
+    """N_i = Σ вес_g · жители группы g.
+
+    people — жители клеток по группам (колонки — имена групп). Группы одного
+    определения не должны пересекаться по возрасту: {18–64, 65+, 80+} считала
+    бы людей 80+ дважды, и N молча вырос бы там, где много старших."""
+    unknown = [name for name in definition if name not in groups]
+    if unknown:
+        raise ValueError(f"в определении нуждаемости неизвестные группы {unknown}; "
+                         f"есть {list(groups)}")
+    overlap = _overlapping(groups, list(definition))
+    if overlap:
+        raise ValueError(f"группы пересекаются по возрасту: {overlap}")
+    missing = [name for name in definition if name not in people.columns]
+    if missing:
+        raise ValueError(f"нет жителей групп {missing} — перепрогони prepare-city")
+    return sum(weight(value, r) * people[name] for name, value in definition.items())
+
+
+def need_all(people: pd.DataFrame, need_rules: dict, groups: dict) -> dict[str, pd.Series]:
+    """Все определения нуждаемости из конфига: основное и проверки устойчивости."""
+    definitions = need_rules["definitions"]
+    if need_rules["main"] not in definitions:
+        raise ValueError(f"основное определение {need_rules['main']!r} не описано")
+    return {name: need(people, definition, need_rules["r"], groups)
+            for name, definition in definitions.items()}
+
+
+def cell_groups(features: pd.DataFrame, prefix: str = "pop_") -> pd.DataFrame:
+    """Жители клеток по группам из таблицы признаков (колонки pop_<группа>)."""
+    columns = [c for c in features.columns if c.startswith(prefix)]
+    return features[columns].rename(columns=lambda c: c[len(prefix):])
 
 
 def match(totals_: SectionTotals, codes: set[str]) -> dict:

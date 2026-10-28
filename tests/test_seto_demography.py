@@ -75,6 +75,61 @@ def test_unreadable_age_is_an_error():
         DM.totals(rows(("1", "1", "n/a", "1", "0")), RULES)
 
 
+# --- нуждаемость (задача 3.3) ---
+
+GROUPS = {"adults_18_64": [18, 64], "seniors_65": [65, None],
+          "seniors_80": [80, None], "adults_18_79": [18, 79]}
+PEOPLE = pd.DataFrame({"adults_18_64": [100.0, 0.0], "seniors_65": [10.0, 50.0],
+                       "seniors_80": [4.0, 30.0], "adults_18_79": [106.0, 20.0]})
+
+
+def test_need_is_weighted_sum_of_groups():
+    n = DM.need(PEOPLE, {"adults_18_64": 1, "seniors_65": "r"}, 2.0, GROUPS)
+    assert n.tolist() == [120.0, 100.0]
+
+
+def test_multiple_of_r_follows_r():
+    """«2r» пересчитывается из r, а не вписан числом — правка r его не забудет."""
+    assert DM.weight("2r", 1.93) == pytest.approx(3.86)
+    assert DM.weight("r", 1.5) == 1.5
+    assert DM.weight(1, 9.0) == 1.0
+
+
+def test_seniors_80_variant_shifts_the_threshold():
+    n = DM.need(PEOPLE, {"adults_18_79": 1, "seniors_80": "r"}, 2.0, GROUPS)
+    assert n.tolist() == [114.0, 80.0]
+
+
+def test_overlapping_groups_would_count_people_twice():
+    with pytest.raises(ValueError, match="пересекаются"):
+        DM.need(PEOPLE, {"adults_18_64": 1, "seniors_65": "r", "seniors_80": "r"},
+                2.0, GROUPS)
+
+
+def test_unknown_group_and_bad_weight_are_errors():
+    with pytest.raises(ValueError, match="неизвестные группы"):
+        DM.need(PEOPLE, {"adults": 1}, 2.0, GROUPS)
+    with pytest.raises(ValueError, match="кратное r"):
+        DM.weight("r2", 2.0)
+    with pytest.raises(ValueError, match="отрицательный"):
+        DM.weight(-1, 2.0)
+
+
+def test_madrid_config_definitions_are_valid():
+    """Все определения из madrid.yaml собираются на его группах."""
+    from seto import settings
+    city = settings.load("madrid")["city"]
+    people = pd.DataFrame({name: [1.0] for name in city["demography"]["groups"]})
+    variants = DM.need_all(people, city["need"], city["demography"]["groups"])
+    assert set(variants) == {"age", "age_r1", "age_r2", "age_80"}
+    assert variants["age_r2"].iloc[0] == pytest.approx(1 + 2 * city["need"]["r"])
+
+
+def test_cell_groups_strips_prefix():
+    features = pd.DataFrame({"cell_id": ["a"], "pop_seniors_65": [3.0], "population": [9.0]})
+    assert DM.cell_groups(features).columns.tolist() == ["seniors_65"]
+
+
 def test_match_reports_both_sides(tmp_path):
     path = tmp_path / "sections.geojson"
     path.write_text(json.dumps({"features": [
