@@ -450,6 +450,38 @@ def _load_city_data(run_dir: Path):
         groups=groups if len(groups.columns) else None)
 
 
+def cmd_step2(args: argparse.Namespace) -> int:
+    """Шаг 2 пропозала v2: A, B, M, BN и М2 при k из m2.k_values — без снимков."""
+    import pandas as pd
+
+    from .costs.timer import CostLog
+    from .experiment.runner import guard_test_city
+    from .experiment.step2 import run_step2
+
+    cfg = config_mod.load(args.city)
+    guard_test_city(cfg, None)
+    prepared = Path(args.prepared_run)
+    data = _load_city_data(prepared)
+    costs = CostLog()
+    with Run.start(args.city, "step2", cfg) as run:
+        logger = RunLogger(run.run_id, run.dir / "log.jsonl")
+        for name in ("manifest.json", "times.npz", "cell_features.parquet"):
+            run.record_input(prepared / name)
+        paths = run_step2(data, cfg, run.dir, logger, costs)
+        for path in paths.values():
+            run.record_output(path)
+        run.record_output(costs.save(run.dir / "costs.json"))
+        logger.close()
+
+    table = pd.read_csv(paths["m2"])
+    columns = ["need", "k", "same_sites", "ceiling_per_1000", "noise_per_1000",
+               "above_noise"]
+    print()
+    print(table[columns].to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(f"\nрезультаты: {run.dir}")
+    return 0
+
+
 def cmd_sensitivity(args: argparse.Namespace) -> int:
     """Устойчивость выводов к T, k и alpha (п. 12)."""
     import json as _json
@@ -676,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--activity", required=True)
     p.add_argument("--note", default=None)
     p.set_defaults(func=cmd_log_human)
+
+    p = sub.add_parser("step2", help="шаг 2: A, B, M, BN и М2 без снимков")
+    p.add_argument("city")
+    p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.set_defaults(func=cmd_step2)
 
     p = sub.add_parser("sensitivity", help="устойчивость к T, k, alpha")
     p.add_argument("city")

@@ -139,6 +139,27 @@ def test_bn_equal_to_b_is_a_result_not_a_duplicate(city, cfg):
     assert by_name["BN"].status == "ok" and "совпало с B" in by_name["BN"].note
 
 
+def test_step2_writes_everything_needed_to_recompute(city, cfg, tmp_path):
+    """Шаг 2: варианты, разницы и М2 по каждому k и определению N — на диск."""
+    from seto.experiment.step2 import run_step2
+
+    _with_groups(city, adults=[100.0, 0, 0, 0], seniors=[0, 0, 500.0, 500.0])
+    city_cfg = {**NEED_CITY, "need": {**NEED_CITY["need"], "definitions": {
+        "age": {"adults_18_64": 1, "seniors_65": "r"},
+        "age_r1": {"adults_18_64": 1, "seniors_65": 1}}}}
+    full = {**cfg, "city": city_cfg, "t_max_minutes": 60,
+            "m2": {"k_values": [1, 2], "noise_draws": 4, "noise_amplitude": 0.1,
+                   "noise_percentile": 95}}
+    paths = run_step2(city, full, tmp_path)
+    m2 = pd.read_csv(paths["m2"])
+    assert len(m2) == 4 and set(m2["k"]) == {1, 2}
+    assert m2.loc[(m2.need == "age") & (m2.k == 2), "BN_sites"].iloc[0] == "[0, 2]"
+    metrics = pd.read_csv(paths["metrics"])
+    assert {"B", "M", "BN"} <= set(metrics["variant"])   # у A строки нет: только распределение
+    for path in paths.values():
+        assert path.exists()
+
+
 def test_identical_solution_marked_as_duplicate(city, cfg):
     """Правило «C ≈ B»: совпало с B — дубликат не считается (п. 9)."""
     scores = np.zeros(4)                            # скор ничего не меняет
