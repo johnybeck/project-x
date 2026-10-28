@@ -29,11 +29,15 @@ class Solution:
     variant: str
     evaluated: int                # сколько наборов рассмотрено
     tie_count: int = 0            # сколько наборов дали тот же оптимум
+    spread: dict | None = None    # только у эвристики: разброс между стартами
 
     def as_dict(self) -> dict:
-        return {"variant": self.variant, "sites": list(self.sites),
-                "objective": self.objective, "evaluated": self.evaluated,
-                "tie_count": self.tie_count}
+        result = {"variant": self.variant, "sites": list(self.sites),
+                  "objective": self.objective, "evaluated": self.evaluated,
+                  "tie_count": self.tie_count}
+        if self.spread is not None:
+            result["spread"] = self.spread
+        return result
 
 
 def _improvement(site_times: np.ndarray, base_times: np.ndarray) -> np.ndarray:
@@ -117,6 +121,98 @@ def solve_pmedian(site_times: np.ndarray, base_times: np.ndarray,
         score, len(site_times), allowed,
         chunk=chunk_for(len(site_times), site_times.shape[1]))
     return Solution(tuple(sorted(pair)), float(value), variant, evaluated, ties)
+
+
+# --- k = 5 и 10: эвристика обмена (пропозал v2, п. 3.4) ---
+# Полный перебор при k > 2 невозможен (434 площадки — 1,3·10^10 пятёрок), а
+# ILP с ограничением на каждую неразнесённую пару на городе не укладывается.
+# Пропозал закладывает эвристику обмена с нескольких случайных стартов — она
+# не гарантирует оптимум, поэтому разброс между стартами всегда выводится, а
+# при k = 2 её ответ сверяется с полным перебором (тест).
+
+def _random_start(allowed: np.ndarray, k: int, rng: np.random.Generator,
+                  attempts: int = 1000) -> list[int]:
+    """Случайный допустимый набор: площадки в случайном порядке, берём каждую,
+    что разнесена со всеми уже взятыми."""
+    for _ in range(attempts):
+        chosen: list[int] = []
+        for candidate in rng.permutation(len(allowed)):
+            if all(allowed[candidate, other] for other in chosen):
+                chosen.append(int(candidate))
+                if len(chosen) == k:
+                    return chosen
+    raise ValueError(f"не удалось набрать {k} разнесённых площадок "
+                     f"за {attempts} попыток")
+
+
+def _swap_search(gain: np.ndarray, allowed: np.ndarray, start: list[int],
+                 max_iterations: int) -> tuple[list[int], float, int]:
+    """Обмен Тейтца — Барта до локального оптимума.
+
+    На каждом шаге перебираются ВСЕ замены «площадку из набора на площадку вне
+    его», допустимые по разнесению, и делается лучшая. Ценность набора — та
+    же, что у полного перебора: Σ_i max_{j∈S} gain[j, i]."""
+    chosen = list(start)
+    value = float(gain[chosen].max(axis=0).sum())
+    iterations = 0
+    while iterations < max_iterations:
+        iterations += 1
+        best_value, best_move = value, None
+        for position, leaving in enumerate(chosen):
+            rest = chosen[:position] + chosen[position + 1:]
+            # лучший выигрыш клетки без уходящей площадки
+            kept = gain[rest].max(axis=0) if rest else np.zeros(gain.shape[1])
+            values = np.maximum(gain, kept[None, :]).sum(axis=1)
+            feasible = (allowed[:, rest].all(axis=1) if rest
+                        else np.ones(len(gain), bool))
+            feasible[chosen] = False
+            if not feasible.any():
+                continue
+            values = np.where(feasible, values, -np.inf)
+            entering = int(np.argmax(values))          # при ничьей — меньший индекс
+            if values[entering] > best_value * (1 + 1e-12) + 1e-12:
+                best_value, best_move = float(values[entering]), (position, entering)
+        if best_move is None:
+            break
+        chosen[best_move[0]] = best_move[1]
+        value = best_value
+    return sorted(chosen), value, iterations
+
+
+def solve_pmedian_swap(site_times: np.ndarray, base_times: np.ndarray,
+                       weights: np.ndarray, allowed: np.ndarray, k: int,
+                       variant: str = "B", starts: int = 20, seed: int = 0,
+                       max_iterations: int = 1000) -> Solution:
+    """P-median при любом k эвристикой обмена с `starts` случайных стартов.
+
+    Цель та же, что у solve_pmedian: argmin Σ w_i·t_i(S). Из стартов берётся
+    лучший набор; при равной цели — лексикографически меньший (как у
+    перебора). В spread — цели всех стартов: если они сильно расходятся,
+    стартов мало или задача рельефная, и это видно в отчёте."""
+    gain = _improvement(site_times, base_times) * weights[None, :]
+    rng = np.random.default_rng(seed)
+    results = []
+    for _ in range(starts):
+        sites, value, iterations = _swap_search(
+            gain, allowed, _random_start(allowed, k, rng), max_iterations)
+        if iterations >= max_iterations:
+            raise ValueError(f"обмен не сошёлся за {max_iterations} шагов")
+        results.append((value, tuple(sites)))
+
+    best_value = max(value for value, _ in results)
+    # ничья между стартами — с той же относительной точностью, что и шаг обмена
+    winners = sorted(sites for value, sites in results
+                     if value >= best_value * (1 - 1e-12) - 1e-12)
+    best = winners[0]
+    validate(best, allowed, expected_k=k)
+    objectives = np.array([value for value, _ in results])
+    spread = {"starts": starts, "seed": seed,
+              "best": float(best_value), "worst": float(objectives.min()),
+              "median": float(np.median(objectives)),
+              "reached_best": len(winners),
+              "distinct_solutions": len({sites for _, sites in results})}
+    return Solution(best, float(best_value), variant, evaluated=-1,
+                    tie_count=len(set(winners)) - 1, spread=spread)
 
 
 def solve_max_coverage(site_times: np.ndarray, base_times: np.ndarray,

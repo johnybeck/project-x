@@ -267,6 +267,64 @@ def test_ilp_pmedian_prefers_high_weight_cells():
     assert set(solution.sites) == {0, 1}    # там наибольший вес спроса
 
 
+# --- эвристика обмена при k > 2 (задача 4.1 TODO_V2) ---
+
+def _random_city(seed: int, sites: int = 25, cells: int = 60, keep: float = 0.8):
+    """Случайный город: времена, веса и разнесение — ответ даёт полный перебор."""
+    rng = np.random.default_rng(seed)
+    base = rng.uniform(10, 60, cells)
+    site_times = rng.uniform(1, 60, (sites, cells))
+    weights = rng.uniform(0, 100, cells)
+    allowed = rng.random((sites, sites)) < keep
+    allowed = allowed & allowed.T
+    np.fill_diagonal(allowed, False)
+    return site_times, base, weights, allowed
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_swap_matches_exhaustive_at_k2(seed):
+    """Главная проверка эвристики: при k = 2 — тот же оптимум, что у перебора."""
+    site_times, base, weights, allowed = _random_city(seed)
+    exhaustive = SV.solve_pmedian(site_times, base, weights, allowed, k=2)
+    swap = SV.solve_pmedian_swap(site_times, base, weights, allowed, k=2)
+    assert swap.objective == pytest.approx(exhaustive.objective, rel=1e-12)
+    assert swap.sites == exhaustive.sites
+
+
+def test_swap_matches_ilp_at_k3():
+    site_times, base, weights, allowed = _random_city(0, sites=12, cells=30)
+    ilp = SV.solve_ilp(site_times, base, weights, allowed, k=3)
+    swap = SV.solve_pmedian_swap(site_times, base, weights, allowed, k=3)
+    # у ILP цель со знаком минус и без постоянной части — сравниваем наборы
+    assert set(swap.sites) == set(ilp.sites)
+
+
+def test_swap_respects_separation_and_size():
+    # keep = 0,85 → после симметризации разрешено ~72 % пар; часть пар
+    # запрещена, и ограничение действительно работает
+    site_times, base, weights, allowed = _random_city(3, keep=0.85)
+    solution = SV.solve_pmedian_swap(site_times, base, weights, allowed, k=5)
+    assert len(solution.sites) == 5
+    FS.validate(solution.sites, allowed, expected_k=5)
+
+
+def test_swap_is_reproducible_and_reports_spread():
+    site_times, base, weights, allowed = _random_city(4)
+    first = SV.solve_pmedian_swap(site_times, base, weights, allowed, k=5, seed=7)
+    again = SV.solve_pmedian_swap(site_times, base, weights, allowed, k=5, seed=7)
+    assert first.sites == again.sites
+    spread = first.spread
+    assert spread["starts"] == 20 and 1 <= spread["reached_best"] <= 20
+    assert spread["worst"] <= spread["median"] <= spread["best"] == first.objective
+
+
+def test_swap_fails_loudly_when_k_sites_cannot_be_separated():
+    site_times, base, weights, allowed = _toy()
+    allowed[:] = False                        # ни одной разнесённой пары
+    with pytest.raises(ValueError, match="разнесённых"):
+        SV.solve_pmedian_swap(site_times, base, weights, allowed, k=2)
+
+
 def test_built_from_can_be_overridden_per_city():
     """Там, где тип здания в OSM почти не проставлен, застройку считают по
     всем зданиям: в Люцерне тип есть у 26 % против 56 % в Москве."""
