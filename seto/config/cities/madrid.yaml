@@ -86,6 +86,28 @@ registry:
     "не государственная сеть региона":
       column: dependecia_funcional
       values: ["Servicios o Institutos de Salud de las CC.AA"]
+  # Центры сети без координат в реестре. Каждый найден в OSM как центр
+  # здоровья на той же улице (и с тем же номером дома, где он есть);
+  # координаты — центроид объекта OSM в EPSG:25830, выгрузка 28.10.2026.
+  # Подставляются ТОЛЬКО центрам без координат: точка для центра с
+  # координатами или для центра вне сети — ошибка, а не тихая замена.
+  manual_points:
+    CS1135:
+      x: 443761
+      y: 4481499
+      source: "OSM w339068441 «Centro de Salud Jazmín», calle del Jazmín 33"
+    CS1184:
+      x: 440525
+      y: 4468565
+      source: "OSM w318323407 «Centro de Salud Orcasur», calle Arenas del Rey 1 (в реестре s/n)"
+    CS19950:
+      x: 443345
+      y: 4476709
+      source: "OSM w1255670012 «Centro de Salud Baviera», calle Pintor Moreno Carbonero 21"
+    CS6158:
+      x: 433667
+      y: 4471784
+      source: "OSM w391435113 «Centro de Salud Campamento», calle Mirueña 5 (в реестре s/n)"
 
 # ВРЕМЕННО, до задачи 2.3 (сеть из реестра, docs/TODO_V2.md): правила
 # глобального конфига написаны под русские названия и в Мадриде не найдут

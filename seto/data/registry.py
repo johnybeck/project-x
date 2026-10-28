@@ -49,8 +49,10 @@ class RegistrySelection:
                 f"{self.candidates} кандидатов")
 
     def as_dict(self) -> dict:
+        manual = self.frame.index[self.frame["coord_source"] == "manual"]
         return {"source": "registry", "candidates": self.candidates,
                 "selected": self.selected, "excluded_by": self.excluded_by,
+                "manual_points": manual.tolist(),
                 "no_coordinates": len(self.no_coordinates),
                 "no_coordinates_ids": self.no_coordinates.index.tolist()}
 
@@ -100,10 +102,19 @@ def select(centres: pd.DataFrame, rules: dict) -> RegistrySelection:
 
     x = pd.to_numeric(remaining[rules["x_column"]], errors="coerce")
     y = pd.to_numeric(remaining[rules["y_column"]], errors="coerce")
+    source = pd.Series("registry", index=remaining.index, dtype=object)
+    note = pd.Series(None, index=remaining.index, dtype=object)
+
+    manual = rules.get("manual_points") or {}
+    _check_manual(manual, remaining.index, x.notna() & y.notna())
+    for centre, point in manual.items():
+        x[centre], y[centre] = float(point["x"]), float(point["y"])
+        source[centre], note[centre] = "manual", point["source"]
+
     located = x.notna() & y.notna()
     kept = remaining[located]
     frame = gpd.GeoDataFrame(
-        kept.assign(coord_source="registry"),
+        kept.assign(coord_source=source[located], coord_note=note[located]),
         geometry=gpd.points_from_xy(x[located], y[located]),
         crs=rules["crs"])
 
@@ -111,6 +122,25 @@ def select(centres: pd.DataFrame, rules: dict) -> RegistrySelection:
                                   candidates=len(candidates), excluded_by=excluded_by)
     selection.check()
     return selection
+
+
+def _check_manual(manual: dict, network: pd.Index, located: pd.Series) -> None:
+    """Ручная точка — только дыра в реестре, а не его правка.
+
+    Точка для учреждения вне сети значит, что конфиг устарел или в нём
+    опечатка; точка для учреждения с координатами молча перебила бы реестр.
+    И то и другое — ошибка, а не повод выбрать одно из двух."""
+    outside = [centre for centre in manual if centre not in network]
+    if outside:
+        raise ValueError(f"ручные точки для учреждений вне сети: {outside}")
+    overriding = [centre for centre in manual if located[centre]]
+    if overriding:
+        raise ValueError(
+            f"ручные точки для учреждений, у которых координаты в реестре есть: "
+            f"{overriding} — реестр ручной точкой не перебивается")
+    unexplained = [centre for centre, point in manual.items() if not point.get("source")]
+    if unexplained:
+        raise ValueError(f"у ручных точек не указан источник: {unexplained}")
 
 
 def load(path: Path, rules: dict) -> RegistrySelection:

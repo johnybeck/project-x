@@ -96,6 +96,42 @@ def test_conflicting_type_within_one_centre_is_an_error(tmp_path):
         RG.load(path, RULES)
 
 
+MANUAL = {"CS2": {"x": 440500, "y": 4474500, "source": "OSM w1 «Centro de Salud X»"}}
+
+
+def test_manual_point_fills_the_gap_and_is_marked(tmp_path):
+    """Точка из конфига ставит центр на карту, и видно, что она ручная."""
+    path = csv(tmp_path,
+               "CS1;Centro de salud;SERMAS;Madrid;x;440000;4474000",
+               "CS2;Centro de salud;SERMAS;Madrid;x;;")
+    sel = RG.load(path, {**RULES, "manual_points": MANUAL})
+    assert sel.selected == 2 and sel.no_coordinates.empty
+    point = sel.frame.loc["CS2"]
+    assert (point.geometry.x, point.geometry.y) == (440500, 4474500)
+    assert point.coord_source == "manual" and point.coord_note.startswith("OSM w1")
+    assert sel.frame.loc["CS1", "coord_source"] == "registry"
+    assert sel.as_dict()["manual_points"] == ["CS2"]
+
+
+def test_manual_point_never_overrides_registry(tmp_path):
+    path = csv(tmp_path, "CS2;Centro de salud;SERMAS;Madrid;x;440000;4474000")
+    with pytest.raises(ValueError, match="перебивается"):
+        RG.load(path, {**RULES, "manual_points": MANUAL})
+
+
+def test_manual_point_for_centre_outside_network_is_an_error(tmp_path):
+    """Устаревший конфиг: центр исключён правилом, а точка для него осталась."""
+    path = csv(tmp_path, "CS2;Hospital general;SERMAS;Madrid;x;;")
+    with pytest.raises(ValueError, match="вне сети"):
+        RG.load(path, {**RULES, "manual_points": MANUAL})
+
+
+def test_manual_point_must_say_where_it_came_from(tmp_path):
+    path = csv(tmp_path, "CS2;Centro de salud;SERMAS;Madrid;x;;")
+    with pytest.raises(ValueError, match="источник"):
+        RG.load(path, {**RULES, "manual_points": {"CS2": {"x": 1, "y": 2}}})
+
+
 def test_counts_always_add_up(tmp_path):
     path = csv(tmp_path,
                "CS1;Centro de salud;SERMAS;Madrid;x;440000;4474000",
