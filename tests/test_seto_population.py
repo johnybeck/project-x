@@ -109,6 +109,81 @@ def test_empty_raster_raises(tmp_path):
         POP.to_cells(raster, make_grid())
 
 
+# --- итоги регистра, разложенные по растру (задача 3.2 TODO_V2) ---
+# Сетка — две клетки 500 м: x 400 000–400 500 и 400 500–401 000. Участок A
+# занимает x 400 000–400 700 (пересекает обе клетки), участок B — 400 700–401 000.
+
+def _sections(with_b: bool = True):
+    rows = [("A", box(400_000, 6_199_500, 400_700, 6_200_000))]
+    if with_b:
+        rows.append(("B", box(400_700, 6_199_500, 401_000, 6_200_000)))
+    return gpd.GeoDataFrame({"code": [r[0] for r in rows]},
+                            geometry=[r[1] for r in rows], crs=UTM)
+
+
+def _totals(**sections):
+    """Итоги по участкам: code=(всего, до 18, 18–64, 65+)."""
+    import pandas as pd
+    return pd.DataFrame(
+        [(code, *values) for code, values in sections.items()],
+        columns=["code", "total", "under_18", "adults_18_64", "seniors_65"]
+    ).set_index("code").astype(float)
+
+
+def test_registry_totals_spread_by_area_when_raster_is_uniform(tmp_path):
+    """5/7 участка A лежит в первой клетке — туда и 5/7 его жителей."""
+    raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))
+    transfer = POP.registry_to_cells(
+        raster, make_grid(), _sections(),
+        _totals(A=(70, 10, 40, 20), B=(300, 0, 200, 100)))
+    cells = transfer.groups
+    assert cells["total"].tolist() == pytest.approx([50, 320])
+    assert cells["seniors_65"].tolist() == pytest.approx([20 * 5 / 7, 20 * 2 / 7 + 100])
+    assert transfer.loss_share < 1e-9
+
+
+def test_raster_decides_where_people_live_inside_a_section(tmp_path):
+    """Внутри A растр плотнее слева (3 на пиксель против 1) — туда и люди."""
+    values = np.ones((5, 10))
+    values[:, :5] = 3.0
+    raster = make_raster(tmp_path / "pop.tif", values)
+    cells = POP.registry_to_cells(raster, make_grid(), _sections(),
+                                  _totals(A=(85, 0, 85, 0), B=(0, 0, 0, 0))).groups
+    # в A: 25 пикселей по 3 слева и 10 по 1 справа — веса 75 и 10
+    assert cells["total"].tolist() == pytest.approx([75, 10])
+
+
+def test_registry_overrides_raster_totals(tmp_path):
+    """Аэропорт: растр видит в участке тысячи «жителей», регистр — троих."""
+    values = np.ones((5, 10))
+    values[:, 7:] = 1000.0
+    raster = make_raster(tmp_path / "pop.tif", values)
+    transfer = POP.registry_to_cells(raster, make_grid(), _sections(),
+                                     _totals(A=(70, 0, 70, 0), B=(3, 0, 3, 0)))
+    assert transfer.groups.loc["cell_000001", "total"] == pytest.approx(20 + 3)
+    assert transfer.report["raster_total_in_sections"] == pytest.approx(35 + 15_000)
+
+
+def test_section_without_raster_is_spread_by_area_and_reported(tmp_path):
+    values = np.ones((5, 10))
+    values[:, 7:] = 0.0
+    raster = make_raster(tmp_path / "pop.tif", values)
+    transfer = POP.registry_to_cells(raster, make_grid(), _sections(),
+                                     _totals(A=(70, 0, 70, 0), B=(30, 0, 30, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([50, 50])
+    assert transfer.report["sections_without_raster"] == {"B": 30}
+
+
+def test_section_without_boundary_is_reported_not_spread(tmp_path):
+    """Участок есть в регистре, но не на карте: класть его людей некуда."""
+    raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))
+    transfer = POP.registry_to_cells(raster, make_grid(), _sections(with_b=False),
+                                     _totals(A=(70, 0, 70, 0), B=(3, 0, 3, 0)))
+    assert transfer.groups["total"].sum() == pytest.approx(70)
+    assert transfer.report["sections_without_geometry"] == {"B": 3}
+    assert transfer.report["source_total"] == 70
+
+
 # --- признаки клеток ---
 
 def _buildings(*specs):

@@ -21,6 +21,7 @@ from ..acquire.osm import describe_layers
 from ..costs.timer import SHARED, CostLog
 from ..data import boundary as boundary_mod
 from ..data import clinics as clinics_mod
+from ..data import demography as demography_mod
 from ..data import features as features_mod
 from ..data import grid as grid_mod
 from ..data import osm_layers as layers_mod
@@ -44,6 +45,9 @@ class CityData:
     site_index: np.ndarray            # позиции площадок в сетке
     allowed_pairs: np.ndarray
     report: dict
+    # жители клетки по возрастным группам (колонки из конфига) — есть только
+    # там, где население берётся из регистра; иначе None
+    groups: pd.DataFrame | None = None
 
     def save(self, out_dir: Path) -> dict[str, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -55,8 +59,12 @@ class CityData:
             "sites": out_dir / "sites.parquet",
         }
         self.grid.to_parquet(paths["grid"])
-        self.features.assign(population=self.population).to_parquet(
-            paths["cell_features"])
+        features = self.features.assign(population=self.population)
+        if self.groups is not None:
+            groups = self.groups.drop(columns="total", errors="ignore")
+            features = features.assign(**{f"pop_{name}": groups[name].to_numpy()
+                                          for name in groups.columns})
+        features.to_parquet(paths["cell_features"])
         self.clinics.drop(columns="geometry").assign(
             lon=self.clinics.to_crs(4326).geometry.x,
             lat=self.clinics.to_crs(4326).geometry.y).to_csv(
@@ -120,6 +128,39 @@ def _base_network(cfg: dict, raw: Path, points: gpd.GeoDataFrame,
     return clinics, selection, len(medical)
 
 
+def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame):
+    """Население клеток: из растра (как в Москве) или итоги регистра по участкам,
+    разложенные по растру (Мадрид, MADRID_DATA п. 6). Способ — в конфиге
+    города, `population.method`; по умолчанию raster."""
+    method = settings.setting(cfg, "population").get("method", "raster")
+    if method not in ("raster", "registry_by_raster"):
+        raise settings.ConfigError(
+            f"population.method должен быть raster или registry_by_raster, "
+            f"а не {method!r}")
+    tolerance = cfg["population"]["mass_tolerance"]
+    raster = _population_raster(raw)
+    if method == "raster":
+        return population_mod.to_cells(raster, grid, tolerance)
+
+    rules = cfg["city"]["demography"]
+    tables = cfg["city"]["sources"]["tables"]
+    paths = {key: raw / tables[table]["file"]
+             for key, table in (("people", rules["table"]),
+                                ("sections", rules["sections"]["table"]))}
+    for path in paths.values():
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"нет {path}. Сначала `python -m seto acquire {cfg['city']['name']}`")
+    totals = demography_mod.totals(demography_mod.read(paths["people"], rules), rules)
+    sections = demography_mod.boundaries(paths["sections"], rules["sections"], grid.crs)
+    transfer = population_mod.registry_to_cells(raster, grid, sections, totals.table,
+                                                tolerance)
+    # люди без участка в регистре — тоже в отчёт, а не в никуда
+    transfer.report.update({f"registry_{k}": v for k, v in totals.as_dict().items()
+                            if k.startswith("unassigned")})
+    return transfer
+
+
 def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                  costs: CostLog | None = None) -> CityData:
     """Собрать все общие данные города."""
@@ -158,11 +199,10 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         say("слои OSM", buildings=len(layers["buildings"]), roads=len(roads))
 
     with costs.stage("population", SHARED) as extra:
-        raster = _population_raster(raw)
-        transfer = population_mod.to_cells(
-            raster, grid, cfg["population"]["mass_tolerance"])
+        transfer = _population(cfg, raw, grid)
         extra.update(transfer.as_dict())
         population = transfer.per_cell.to_numpy()
+        groups = getattr(transfer, "groups", None)
         say("население", total=int(population.sum()),
             loss=transfer.loss_share)
 
@@ -257,7 +297,7 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                     clinics=clinics, base_times=base_times,
                     clinic_times=clinic_times,
                     site_times=site_times, site_index=chosen.index,
-                    allowed_pairs=allowed, report=report)
+                    allowed_pairs=allowed, report=report, groups=groups)
     data.save(out_dir)
     return data
 

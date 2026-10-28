@@ -118,6 +118,17 @@ def boundary_codes(path: Path, rules: dict) -> set[str]:
                        for key, value in exclude.items())}
 
 
+def boundaries(path: Path, rules: dict, crs) -> "gpd.GeoDataFrame":
+    """Полигоны участков (колонка code) в проекции сетки, без контуров районов."""
+    import geopandas as gpd
+
+    frame = gpd.read_file(path)
+    for key, value in rules.get("exclude", {}).items():
+        frame = frame[frame[key] != value]
+    frame = frame.rename(columns={rules["code_column"]: "code"})
+    return frame[["code", "geometry"]].to_crs(crs).reset_index(drop=True)
+
+
 def match(totals_: SectionTotals, codes: set[str]) -> dict:
     """Сверка участков населения с участками на карте.
 
