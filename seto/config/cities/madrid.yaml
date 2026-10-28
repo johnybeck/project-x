@@ -109,6 +109,37 @@ registry:
       y: 4471784
       source: "OSM w391435113 «Centro de Salud Campamento», calle Mirueña 5 (в реестре s/n)"
 
+# Жители по участкам и возрасту (пропозал v2, п. 3.3; MADRID_DATA п. 3).
+# Одна строка падрона — участок × возраст по одному году; жители разбиты на
+# четыре колонки (испанцы и иностранцы, мужчины и женщины).
+demography:
+  table: padron                    # имя из sources.tables
+  sep: ";"
+  encoding: "utf-8-sig"            # в файле BOM
+  # Код участка INE (CUSEC) = муниципалитет + район (2 знака) + участок (3).
+  code_prefix: "28079"
+  district_column: COD_DISTRITO
+  district_digits: 2
+  section_column: COD_SECCION
+  section_digits: 3
+  age_column: COD_EDAD_INT         # «  54», последний класс — «100 o +»
+  count_columns: [ESPANOLESHOMBRES, ESPANOLESMUJERES,
+                  EXTRANJEROSHOMBRES, EXTRANJEROSMUJERES]
+  # Группы — [от, до] включительно, null — без верхней границы.
+  # 80+ вложена в 65+: она нужна только для проверки устойчивости (п. 3.3).
+  groups:
+    under_18: [0, 17]
+    adults_18_64: [18, 64]
+    seniors_65: [65, null]
+    seniors_80: [80, null]
+  # Эти группы обязаны давать всё население участка без остатка.
+  partition: [under_18, adults_18_64, seniors_65]
+  # Границы участков: в выдаче INE есть и контуры районов — их не берём.
+  sections:
+    table: sections
+    code_column: CUSEC
+    exclude: {TIPO: DISTRITO}
+
 # Сеть берётся из реестра (раздел registry выше), а не из OSM по названию:
 # русские правила глобального конфига здесь не нужны и не применяются.
 base_network:
