@@ -8,7 +8,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -201,6 +201,111 @@ def test_section_without_boundary_is_reported_not_spread(tmp_path):
     assert transfer.groups["total"].sum() == pytest.approx(70)
     assert transfer.report["sections_without_geometry"] == {"B": 3}
     assert transfer.report["source_total"] == 70
+
+
+# --- итоги регистра, разложенные по квартирам кадастра ---
+# Те же две клетки и участки A и B. Здание — прямоугольник с числом квартир.
+
+def _flats(*specs):
+    """specs: (квартиры, контур)."""
+    return gpd.GeoDataFrame({"dwellings": [s[0] for s in specs]},
+                            geometry=[s[1] for s in specs], crs=UTM)
+
+
+LEFT = box(400_100, 6_199_600, 400_120, 6_199_620)      # клетка 0, участок A
+RIGHT = box(400_600, 6_199_600, 400_620, 6_199_620)     # клетка 1, участок A
+FAR = box(400_800, 6_199_600, 400_820, 6_199_620)       # клетка 1, участок B
+
+
+def _by_dwellings(tmp_path, flats, totals, values=None, limit=6, sections=None):
+    raster = make_raster(tmp_path / "pop.tif",
+                         np.ones((5, 10)) if values is None else values)
+    return POP.registry_by_dwellings(flats, raster, make_grid(),
+                                     _sections() if sections is None else sections,
+                                     totals, limit)
+
+
+def test_flats_decide_where_people_live_inside_a_section(tmp_path):
+    """Растр ровный, но три четверти квартир участка A — в левой клетке."""
+    transfer = _by_dwellings(tmp_path, _flats((30, LEFT), (10, RIGHT), (10, FAR)),
+                             _totals(A=(80, 8, 40, 32), B=(20, 0, 20, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([60, 40])
+    assert transfer.groups["seniors_65"].tolist() == pytest.approx([24, 8])
+    assert transfer.loss_share < 1e-9
+
+
+def test_section_totals_stay_with_the_registry(tmp_path):
+    """Квартир в B вдесятеро больше, но людей в участке столько, сколько в падроне."""
+    transfer = _by_dwellings(tmp_path, _flats((10, LEFT), (100, FAR)),
+                             _totals(A=(30, 0, 30, 0), B=(30, 0, 30, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([30, 30])
+
+
+def test_building_is_cut_between_cells_by_area(tmp_path):
+    """Здание лежит на обеих клетках, 3/4 контура — в левой."""
+    across = box(400_350, 6_199_600, 400_550, 6_199_620)
+    transfer = _by_dwellings(tmp_path, _flats((40, across)),
+                             _totals(A=(80, 0, 80, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([60, 20])
+
+
+def test_building_is_cut_between_sections_by_area(tmp_path):
+    """Комплекс на два участка: квартиры обоим, и никто не остаётся без них."""
+    across = box(400_600, 6_199_600, 400_800, 6_199_620)
+    transfer = _by_dwellings(tmp_path, _flats((40, across)),
+                             _totals(A=(30, 0, 30, 0), B=(30, 0, 30, 0)))
+    assert transfer.report["sections_by_raster"] == {}
+    assert transfer.groups["total"].tolist() == pytest.approx([0, 60])
+
+
+def test_section_with_too_many_people_per_flat_falls_back_to_raster(tmp_path):
+    """Кадастр не видит жильё: 70 жителей на одну квартиру ложатся по растру."""
+    transfer = _by_dwellings(tmp_path, _flats((1, LEFT), (10, FAR)),
+                             _totals(A=(70, 0, 70, 0), B=(20, 0, 20, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([50, 40])
+    assert transfer.report["sections_by_raster"] == {"A": 70}
+
+
+def test_section_exactly_at_the_limit_stays_on_flats(tmp_path):
+    transfer = _by_dwellings(tmp_path, _flats((10, LEFT)), _totals(A=(60, 0, 60, 0)))
+    assert transfer.report["sections_by_raster"] == {}
+    assert transfer.groups["total"].tolist() == pytest.approx([60, 0])
+
+
+def test_section_without_flats_falls_back_to_raster(tmp_path):
+    transfer = _by_dwellings(tmp_path, _flats((10, LEFT)),
+                             _totals(A=(20, 0, 20, 0), B=(30, 0, 30, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([20, 30])
+    assert transfer.report["sections_by_raster"] == {"B": 30}
+
+
+def test_section_without_flats_and_raster_is_spread_by_area(tmp_path):
+    values = np.ones((5, 10))
+    values[:, 7:] = 0.0
+    transfer = _by_dwellings(tmp_path, _flats((10, LEFT)),
+                             _totals(A=(20, 0, 20, 0), B=(30, 0, 30, 0)), values)
+    assert transfer.groups["total"].tolist() == pytest.approx([20, 30])
+    assert transfer.report["sections_without_raster"] == {"B": 30}
+
+
+def test_buildings_without_flats_do_not_attract_people(tmp_path):
+    transfer = _by_dwellings(tmp_path, _flats((10, LEFT), (0, RIGHT)),
+                             _totals(A=(40, 0, 40, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([40, 0])
+
+
+def test_broken_footprint_does_not_lose_people(tmp_path):
+    """В кадастре есть самопересекающиеся контуры; людей они терять не должны."""
+    bowtie = Polygon([(400_100, 6_199_600), (400_120, 6_199_620),
+                      (400_120, 6_199_600), (400_100, 6_199_620)])
+    transfer = _by_dwellings(tmp_path, _flats((10, bowtie)), _totals(A=(20, 0, 20, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([20, 0])
+
+
+def test_flats_method_keeps_section_of_cell(tmp_path):
+    transfer = _by_dwellings(tmp_path, _flats((10, LEFT), (10, RIGHT), (10, FAR)),
+                             _totals(A=(20, 0, 20, 0), B=(30, 0, 30, 0)))
+    assert transfer.main_section.tolist() == ["A", "B"]
 
 
 # --- признаки клеток ---

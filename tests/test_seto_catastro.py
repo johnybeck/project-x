@@ -14,7 +14,7 @@ from seto.data import catastro as C  # noqa: E402
 RULES = {"crs": 25830, "residential_use": "1_residential"}
 
 
-def _building(use: str, begin: str, patches=((440_000, 4_470_000),)) -> str:
+def _building(use: str, begin: str, patches=((440_000, 4_470_000),), dwellings=0) -> str:
     """Запись здания: каждый лоскут — квадрат 10 м с углом в заданной точке."""
     rings = "".join(
         f"""<gml:PolygonPatch><gml:exterior><gml:LinearRing>
@@ -30,6 +30,7 @@ def _building(use: str, begin: str, patches=((440_000, 4_470_000),)) -> str:
         <gml:Surface gml:id="s1"><gml:patches>{rings}</gml:patches></gml:Surface>
       </bu-core2d:geometry></bu-core2d:BuildingGeometry></bu-ext2d:geometry>
       <bu-ext2d:currentUse>{use}</bu-ext2d:currentUse>
+      <bu-ext2d:numberOfDwellings>{dwellings}</bu-ext2d:numberOfDwellings>
     </bu-ext2d:Building></gml:featureMember>"""
 
 
@@ -46,13 +47,33 @@ def _archive(path: Path, *buildings: str, name="A.ES.SDGC.BU.28900.building.gml"
     return path
 
 
-def test_reads_only_residential_buildings(tmp_path):
+def test_building_without_homes_is_skipped(tmp_path):
     archive = _archive(tmp_path / "bu.zip",
-                       _building("1_residential", "1963-01-01T00:00:00"),
+                       _building("1_residential", "1963-01-01T00:00:00", dwellings=12),
                        _building("4_1_office", "1990-01-01T00:00:00"))
-    homes = C.read(archive, RULES)
-    assert homes["year"].tolist() == [1963.0]
-    assert homes.crs.to_epsg() == 25830
+    buildings = C.read(archive, RULES)
+    assert buildings["year"].tolist() == [1963.0]
+    assert buildings["dwellings"].tolist() == [12]
+    assert buildings.crs.to_epsg() == 25830
+
+
+def test_flats_in_other_buildings_count_but_are_not_homes(tmp_path):
+    """Квартиры над магазином — это жители, но эпоха клетки считается только по
+    жилым зданиям."""
+    archive = _archive(tmp_path / "bu.zip",
+                       _building("1_residential", "1963-01-01T00:00:00", dwellings=12),
+                       _building("4_2_retail", "1990-01-01T00:00:00", dwellings=3))
+    buildings = C.read(archive, RULES)
+    assert buildings["dwellings"].tolist() == [12, 3]
+    assert C.homes(buildings)["year"].tolist() == [1963.0]
+
+
+def test_footprint_is_kept_for_population(tmp_path):
+    """Здание режется по контуру, поэтому read отдаёт контур, а не точку."""
+    archive = _archive(tmp_path / "bu.zip", _building(
+        "1_residential", "1963-01-01T00:00:00", dwellings=4,
+        patches=((440_000, 4_470_000), (440_100, 4_470_100))))
+    assert C.read(archive, RULES).geometry.iloc[0].area == pytest.approx(200)
 
 
 def test_year_is_oldest_construction():
@@ -76,7 +97,7 @@ def test_point_lies_inside_footprint(tmp_path):
     archive = _archive(tmp_path / "bu.zip", _building(
         "1_residential", "1963-01-01T00:00:00",
         patches=((440_000, 4_470_000), (440_100, 4_470_100))))
-    point = C.read(archive, RULES).geometry.iloc[0]
+    point = C.homes(C.read(archive, RULES)).geometry.iloc[0]
     assert (box(440_000, 4_470_000, 440_010, 4_470_010).contains(point)
             or box(440_100, 4_470_100, 440_110, 4_470_110).contains(point))
 

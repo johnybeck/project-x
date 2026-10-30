@@ -105,6 +105,9 @@ _NETWORK_SOURCES = {
 }
 
 
+_POPULATION_METHODS = ("raster", "registry_by_raster", "registry_by_dwellings")
+
+
 def _base_network(cfg: dict, raw: Path, points: gpd.GeoDataFrame,
                   polygons: gpd.GeoDataFrame, crs):
     """Базовая сеть города: из реестра или из OSM по названию.
@@ -133,15 +136,20 @@ def _base_network(cfg: dict, raw: Path, points: gpd.GeoDataFrame,
     return clinics, selection, len(medical)
 
 
-def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame):
+def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame,
+                buildings: gpd.GeoDataFrame | None):
     """Население клеток: из растра (как в Москве) или итоги регистра по участкам,
-    разложенные по растру (Мадрид, MADRID_DATA п. 6). Способ — в конфиге
-    города, `population.method`; по умолчанию raster."""
-    method = settings.setting(cfg, "population").get("method", "raster")
-    if method not in ("raster", "registry_by_raster"):
+    разложенные по растру либо по квартирам кадастра (Мадрид, MADRID_DATA п. 6
+    и 9). Способ — в конфиге города, `population.method`; по умолчанию raster."""
+    rules_population = settings.setting(cfg, "population")
+    method = rules_population.get("method", "raster")
+    if method not in _POPULATION_METHODS:
         raise settings.ConfigError(
-            f"population.method должен быть raster или registry_by_raster, "
+            f"population.method должен быть одним из {list(_POPULATION_METHODS)}, "
             f"а не {method!r}")
+    if method == "registry_by_dwellings" and buildings is None:
+        raise settings.ConfigError(
+            "population.method = registry_by_dwellings требует раздел buildings")
     tolerance = cfg["population"]["mass_tolerance"]
     raster = _population_raster(raw)
     if method == "raster":
@@ -158,8 +166,13 @@ def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame):
                 f"нет {path}. Сначала `python -m seto acquire {cfg['city']['name']}`")
     totals = demography_mod.totals(demography_mod.read(paths["people"], rules), rules)
     sections = demography_mod.boundaries(paths["sections"], rules["sections"], grid.crs)
-    transfer = population_mod.registry_to_cells(raster, grid, sections, totals.table,
-                                                tolerance)
+    if method == "registry_by_raster":
+        transfer = population_mod.registry_to_cells(raster, grid, sections, totals.table,
+                                                    tolerance)
+    else:
+        transfer = population_mod.registry_by_dwellings(
+            buildings, raster, grid, sections, totals.table,
+            rules_population["max_people_per_dwelling"], tolerance)
     # люди без участка в регистре — тоже в отчёт, а не в никуда
     transfer.report.update({f"registry_{k}": v for k, v in totals.as_dict().items()
                             if k.startswith("unassigned")})
@@ -167,10 +180,10 @@ def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame):
     return transfer
 
 
-def _homes(cfg: dict, raw: Path, crs) -> gpd.GeoDataFrame | None:
-    """Жилые здания с годом постройки; None, если источник у города не задан:
-    тогда в тексте варианта C про год будет «нет данных»."""
-    rules = cfg["city"].get("building_years")
+def _buildings(cfg: dict, raw: Path, crs) -> gpd.GeoDataFrame | None:
+    """Здания с годом постройки и квартирами; None, если источник у города не
+    задан: тогда в тексте варианта C про год будет «нет данных»."""
+    rules = cfg["city"].get("buildings")
     if not rules:
         return None
     path = raw / cfg["city"]["sources"]["tables"][rules["table"]]["file"]
@@ -217,8 +230,11 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
             layers["buildings"], roads, points))
         say("слои OSM", buildings=len(layers["buildings"]), roads=len(roads))
 
+    with costs.stage("buildings", SHARED):
+        buildings = _buildings(cfg, raw, crs)
+
     with costs.stage("population", SHARED) as extra:
-        transfer = _population(cfg, raw, grid)
+        transfer = _population(cfg, raw, grid, buildings)
         extra.update(transfer.as_dict())
         population = transfer.per_cell.to_numpy()
         groups = getattr(transfer, "groups", None)
@@ -227,7 +243,7 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
             loss=transfer.loss_share)
 
     with costs.stage("features", SHARED) as extra:
-        homes = _homes(cfg, raw, crs)
+        homes = None if buildings is None else catastro_mod.homes(buildings)
         features = features_mod.build(grid, layers, roads, points, homes)
         if homes is not None:
             extra.update({"homes": len(homes),

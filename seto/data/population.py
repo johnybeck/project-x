@@ -173,41 +173,37 @@ class RegistryTransfer:
         return {**self.report, "loss_share": self.loss_share}
 
 
-def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
-                      sections: gpd.GeoDataFrame, totals: pd.DataFrame,
-                      tolerance: float = 0.001) -> RegistryTransfer:
-    """Жители каждого участка — по регистру, распределение внутри — по растру.
-
-    Растр (GHS-POP) на Мадриде ошибается на уровне районов: юг занижен, север
-    завышен, в аэропорту тысячи «жителей». Поэтому сколько людей в участке,
-    берётся из регистра, а растр решает только, как они лежат внутри участка.
-
-    Шаги: пиксель режется по границам участков по площади → у каждого куска
-    вес = население пикселя × доля площади → жители участка (по каждой
-    группе) делятся между его кусками пропорционально весу → куски режутся по
-    клеткам по площади. Участок мельче пикселя так тоже получает свою долю —
-    при отнесении пикселя к участку по центру такие участки оставались бы
-    пустыми (в центре Мадрида их 16)."""
-    if grid.crs is None or grid.crs.is_geographic:
-        raise ValueError("сетка должна быть в метрической проекции (UTM)")
+def _section_pixels(raster_path: Path, sections: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Пиксели с населением в рамке участков, в проекции участков; вес — население."""
     import rasterio
 
-    sections = sections.to_crs(grid.crs)
     with rasterio.open(raster_path) as source:
         raster_crs = source.crs
-    frame = gpd.GeoDataFrame(geometry=[box(*sections.total_bounds)], crs=grid.crs)
+    frame = gpd.GeoDataFrame(geometry=[box(*sections.total_bounds)], crs=sections.crs)
     pixels, _ = read_pixels(raster_path, tuple(frame.to_crs(raster_crs).total_bounds))
-    pixels = pixels.to_crs(grid.crs)
-    pixels["pixel_area"] = pixels.geometry.area
+    return pixels.to_crs(sections.crs).rename(columns={"pop": "weight"})
 
-    pieces = gpd.overlay(pixels[["pop", "pixel_area", "geometry"]],
-                         sections[["code", "geometry"]], how="intersection")
-    pieces["weight"] = pieces["pop"] * pieces.geometry.area / pieces["pixel_area"]
-    pieces = pieces[pieces["weight"] > 0]
 
+def _cut_by_sections(sources: gpd.GeoDataFrame,
+                     sections: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Разрезать пиксели или здания по участкам: вес куска — вес источника ×
+    доля его площади. Участок мельче пикселя так тоже получает свою долю — при
+    отнесении к участку по центру такие участки оставались бы пустыми (в
+    центре Мадрида их 16)."""
+    sources = sources[["weight", "geometry"]].assign(source_area=sources.geometry.area)
+    pieces = gpd.overlay(sources, sections[["code", "geometry"]], how="intersection")
+    pieces["weight"] = pieces["weight"] * pieces.geometry.area / pieces["source_area"]
+    return pieces[pieces["weight"] > 0]
+
+
+def _sections_to_cells(pieces: gpd.GeoDataFrame, grid: gpd.GeoDataFrame,
+                       sections: gpd.GeoDataFrame, totals: pd.DataFrame,
+                       tolerance: float, details: dict) -> RegistryTransfer:
+    """Жители участка (по каждой группе) делятся между его кусками
+    пропорционально весу, а куски режутся по клеткам по площади."""
     with_geometry = totals.index.isin(sections["code"])
     populated = totals[with_geometry & (totals["total"] > 0)]
-    # участок с жителями, где растр нулевой: делим жителей по его площади
+    # участок с жителями, где веса нулевые: делим жителей по его площади
     no_raster = populated.index.difference(pieces["code"].unique())
     if len(no_raster):
         uniform = sections[sections["code"].isin(no_raster)].copy()
@@ -238,10 +234,8 @@ def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
                     .drop_duplicates("cell_id").set_index("cell_id")["code"]
                     .reindex(grid["cell_id"]))
 
-    raster_inside = float(pieces.loc[pieces["code"].isin(populated.index)
-                                     & ~pieces["code"].isin(no_raster), "weight"].sum())
     report = {
-        "method": "registry_by_raster",
+        **details,
         "source_total": float(populated["total"].sum()),
         "transferred_total": float(groups["total"].sum()),
         "sections_used": int(len(populated)),
@@ -249,9 +243,6 @@ def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
                                     for code in no_raster},
         "sections_without_geometry": {code: float(totals.loc[code, "total"])
                                       for code in totals.index[~with_geometry]},
-        "raster_total_in_sections": round(raster_inside, 1),
-        "raster_total_in_window": round(float(pixels["pop"].sum()), 1),
-        "pixels_used": int(len(pixels)),
     }
     transfer = RegistryTransfer(groups=groups, report=report, main_section=main_section)
     if transfer.loss_share > tolerance:
@@ -260,3 +251,77 @@ def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
             f"{report['source_total']:,.0f}, в клетках {report['transferred_total']:,.0f} "
             f"(расхождение {100 * transfer.loss_share:.3f} % > {100 * tolerance:.1f} %)")
     return transfer
+
+
+def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
+                      sections: gpd.GeoDataFrame, totals: pd.DataFrame,
+                      tolerance: float = 0.001) -> RegistryTransfer:
+    """Жители каждого участка — по регистру, распределение внутри — по растру.
+
+    Растр (GHS-POP) на Мадриде ошибается на уровне районов: юг занижен, север
+    завышен, в аэропорту тысячи «жителей». Поэтому сколько людей в участке,
+    берётся из регистра, а растр решает только, как они лежат внутри участка."""
+    if grid.crs is None or grid.crs.is_geographic:
+        raise ValueError("сетка должна быть в метрической проекции (UTM)")
+
+    sections = sections.to_crs(grid.crs)
+    pixels = _section_pixels(raster_path, sections)
+    pieces = _cut_by_sections(pixels, sections)
+    populated = totals.index[totals["total"] > 0]
+    details = {
+        "method": "registry_by_raster",
+        "raster_total_in_sections": round(
+            float(pieces.loc[pieces["code"].isin(populated), "weight"].sum()), 1),
+        "raster_total_in_window": round(float(pixels["weight"].sum()), 1),
+        "pixels_used": int(len(pixels)),
+    }
+    return _sections_to_cells(pieces, grid, sections, totals, tolerance, details)
+
+
+def registry_by_dwellings(buildings: gpd.GeoDataFrame, raster_path: Path,
+                          grid: gpd.GeoDataFrame, sections: gpd.GeoDataFrame,
+                          totals: pd.DataFrame, max_people_per_dwelling: float,
+                          tolerance: float = 0.001) -> RegistryTransfer:
+    """Жители каждого участка — по регистру, распределение внутри — по квартирам.
+
+    Растр не отличает жилой дом от склада: в Мадриде он кладёт жителей в 1057
+    клеток без единого жилого здания (MADRID_DATA п. 9). Кадастр знает, сколько
+    квартир в каждом здании.
+
+    Здание режется по контуру, а не ставится точкой: один комплекс на 1473
+    квартиры лежит сразу в четырёх участках, и точка дала бы 820 жителей на
+    1473 квартиры в одном участке и ни одной квартиры в соседнем.
+
+    Если жителей на квартиру больше max_people_per_dwelling, кадастр не видит
+    жильё участка: на Каньяда-Реаль это 3213 жителей на 29 квартир, при 603
+    жилых зданиях в OSM. Такие участки и участки без квартир лежат по растру,
+    как в registry_to_cells: посадить всех жителей в 29 квартир хуже, чем
+    немного ошибиться с пикселями."""
+    if grid.crs is None or grid.crs.is_geographic:
+        raise ValueError("сетка должна быть в метрической проекции (UTM)")
+
+    sections = sections.to_crs(grid.crs)
+    homes = buildings.loc[buildings["dwellings"] > 0, ["dwellings", "geometry"]]
+    homes = homes.assign(geometry=homes.geometry.make_valid()).rename(
+        columns={"dwellings": "weight"})
+    pieces = _cut_by_sections(homes, sections)
+    dwellings = pieces.groupby("code")["weight"].sum()
+
+    people = totals["total"]
+    people = people[people.index.isin(sections["code"]) & (people > 0)]
+    per_dwelling = people / dwellings.reindex(people.index, fill_value=0.0)
+    unseen = people.index[per_dwelling > max_people_per_dwelling]
+    if len(unseen):
+        chosen = sections[sections["code"].isin(unseen)]
+        pieces = pd.concat([pieces[~pieces["code"].isin(unseen)],
+                            _cut_by_sections(_section_pixels(raster_path, chosen), chosen)],
+                           ignore_index=True)
+
+    details = {
+        "method": "registry_by_dwellings",
+        "dwellings_total": float(homes["weight"].sum()),
+        "dwellings_in_sections": round(float(dwellings.sum()), 1),
+        "max_people_per_dwelling": max_people_per_dwelling,
+        "sections_by_raster": {code: float(people[code]) for code in unseen},
+    }
+    return _sections_to_cells(pieces, grid, sections, totals, tolerance, details)

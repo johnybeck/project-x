@@ -1,8 +1,9 @@
-"""Жилые здания кадастра Испании (INSPIRE, тема Buildings) с годом постройки.
+"""Здания кадастра Испании (INSPIRE, тема Buildings): год постройки и квартиры.
 
 Зачем кадастр, а не OSM: в OSM Мадрида год есть у 13 жилых зданий из 69 180, и
 текст варианта C остался бы без эпохи (MADRID_DATA п. 8). В кадастре год есть
-у 99,99 % жилых зданий.
+у 99,99 % жилых зданий. Число квартир нужно населению: кадастр говорит, где
+люди живут, а растр GHS кладёт их и на склады (MADRID_DATA п. 9).
 
 Формат посмотрен на файле A.ES.SDGC.BU.28900.zip: внутри GML на 600 МБ, поэтому
 читаем потоком, а не целиком. Одно «здание» кадастра — все постройки участка:
@@ -39,7 +40,7 @@ def _year(text: str | None) -> float:
 
 def _footprint(building: ET.Element) -> MultiPolygon:
     """Контур участка застройки. Внутренние кольца не нужны: контур здесь
-    только для того, чтобы попасть точкой в клетку."""
+    только для того, чтобы попасть в клетку и в участок падрона."""
     patches = []
     for ring in building.iter(f"{_GML}exterior"):
         values = ring.find(f"{_GML}LinearRing/{_GML}posList").text.split()
@@ -48,10 +49,13 @@ def _footprint(building: ET.Element) -> MultiPolygon:
 
 
 def read(archive: Path, rules: dict) -> gpd.GeoDataFrame:
-    """Жилые здания: год постройки (NaN, если неизвестен) и точка внутри контура.
+    """Здания с жильём: год постройки (NaN, если неизвестен), число квартир,
+    признак жилого назначения и контур.
 
-    rules — раздел `building_years` конфига города: проекция файла и код
-    жилого назначения."""
+    Берём жилые по назначению и любые другие, где есть квартиры: в Мадриде
+    таких квартир 5,7 тыс. из 1,53 млн, и жить в них это не мешает.
+    rules — раздел `buildings` конфига города: проекция файла и код жилого
+    назначения."""
     rows, shapes = [], []
     with zipfile.ZipFile(archive) as bundle:
         inside = [n for n in bundle.namelist() if n.endswith(_BUILDINGS_FILE)]
@@ -61,15 +65,24 @@ def read(archive: Path, rules: dict) -> gpd.GeoDataFrame:
             for _, element in ET.iterparse(stream, events=("end",)):
                 if element.tag != f"{_EXT}Building":
                     continue
-                if element.findtext(f"{_EXT}currentUse") == rules["residential_use"]:
+                residential = element.findtext(f"{_EXT}currentUse") == rules["residential_use"]
+                dwellings = int(element.findtext(f"{_EXT}numberOfDwellings") or 0)
+                if residential or dwellings > 0:
                     begin = element.findtext(
                         f"{_CORE}dateOfConstruction/{_CORE}DateOfEvent/{_CORE}beginning")
-                    rows.append(_year(begin))
+                    rows.append({"year": _year(begin), "dwellings": dwellings,
+                                 "residential": residential})
                     shapes.append(_footprint(element))
                 element.clear()      # иначе дерево всего файла останется в памяти
 
-    if not rows:
+    if not any(row["residential"] for row in rows):
         raise ValueError(f"в {archive} нет зданий с назначением "
-                         f"{rules['residential_use']!r}: проверь раздел building_years")
-    homes = gpd.GeoDataFrame({"year": rows}, geometry=shapes, crs=rules["crs"])
-    return homes.assign(geometry=homes.geometry.representative_point())
+                         f"{rules['residential_use']!r}: проверь раздел buildings")
+    return gpd.GeoDataFrame(rows, geometry=shapes, crs=rules["crs"])
+
+
+def homes(buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Жилые здания точками: чтобы отнести здание к эпохе в клетке, контур не
+    нужен, хватает точки внутри него."""
+    residential = buildings[buildings["residential"]]
+    return residential.assign(geometry=residential.geometry.representative_point())
