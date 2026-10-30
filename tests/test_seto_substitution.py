@@ -77,9 +77,30 @@ def test_noise_moves_b_prime_and_sets_threshold():
     assert table.iloc[0].noise_threshold == 0   # для этих N клетки 0 и 1 равноценны
 
 
+def test_threshold_measures_how_far_noise_moves_the_need_time():
+    """B′ уходит на площадку 1, а нуждающиеся живут у площадки 0: шум виден в Z_N."""
+    data = city()
+    data.population = np.array([1000.0, 990.0, 50.0, 10.0])
+    need = np.array([10.0, 0, 0, 0])
+    table, noise_sites = M2.study(data, {"age": need}, cfg(draws=40), [1])
+    assert {tuple(s) for s in noise_sites[1]} == {(0,), (1,)}
+    assert table.iloc[0].noise_threshold == pytest.approx(10 * (40 - 5))
+
+
 def test_every_need_definition_gets_its_own_row():
     data = city()
     needs = {"age": np.array([10.0, 0, 500, 500]), "age_r1": data.population.copy()}
     table, _ = M2.study(data, needs, cfg(amplitude=0.0), [1, 2])
     assert sorted(zip(table["need"], table["k"])) == [
         ("age", 1), ("age", 2), ("age_r1", 1), ("age_r1", 2)]
+
+
+def test_k_is_reduced_when_sites_cannot_be_separated():
+    """П. 3.2: нельзя разнести k площадок — решаем с наибольшим допустимым k."""
+    data = city()
+    data.allowed_pairs = np.zeros((3, 3), dtype=bool)   # ни одной разнесённой пары
+    table, noise_sites = M2.study(data, {"age": data.population.copy()},
+                                  cfg(amplitude=0.0), [2])
+    row = table.iloc[0]
+    assert (row.k, row.k_used) == (2, 1) and len(row.B_sites) == 1
+    assert list(noise_sites) == [2]

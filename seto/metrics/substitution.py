@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from ..sites import feasible as sites_mod
 from ..variants import solve as solver
 from .coverage import times_with
 
@@ -72,27 +73,31 @@ def study(data, needs: dict[str, np.ndarray], cfg: dict, k_values: list[int],
     """М2 при каждом k и каждом определении нуждаемости.
 
     Возвращает таблицу (строка — определение × k) и решения B′ по k, чтобы
-    порог шума можно было пересчитать из сохранённых файлов без решателя."""
+    порог шума можно было пересчитать из сохранённых файлов без решателя.
+
+    Если k площадок разнести нельзя, задача решается с наибольшим допустимым
+    k (п. 3.2, ограничение 5); в таблице видны оба числа."""
     say = logger.info if logger else (lambda *a, **kw: None)
     params = cfg["m2"]
     t_max = cfg["t_max_minutes"]
     rows, noise_sites = [], {}
-    for k in k_values:
+    for requested in k_values:
+        k = min(requested, sites_mod.max_feasible_k(data.allowed_pairs, requested))
         b = solver.solve_pmedian_any(data.site_times, data.base_times,
                                      data.population, data.allowed_pairs, k, "B", cfg)
         draws = noise_draws(data, cfg, k, params["noise_draws"],
                             params["noise_amplitude"], cfg["seed"])
-        noise_sites[k] = [list(s) for s in draws.sites]
+        noise_sites[requested] = [list(s) for s in draws.sites]
         for name, need in needs.items():
             bn = solver.solve_pmedian_any(data.site_times, data.base_times, need,
                                           data.allowed_pairs, k, "BN", cfg)
             z_b = need_time(data.site_times, data.base_times, b.sites, need, t_max)
             z_bn = need_time(data.site_times, data.base_times, bn.sites, need, t_max)
             ceiling = z_b - z_bn
-            noise, gaps = draws.threshold(data.site_times, data.base_times, need,
-                                          z_b, t_max, params["noise_percentile"])
+            noise, _ = draws.threshold(data.site_times, data.base_times, need,
+                                       z_b, t_max, params["noise_percentile"])
             rows.append({
-                "need": name, "k": k,
+                "need": name, "k": requested, "k_used": k,
                 "B_sites": list(b.sites), "BN_sites": list(bn.sites),
                 "same_sites": set(b.sites) == set(bn.sites),
                 "Z_N_B": z_b, "Z_N_BN": z_bn,
@@ -108,6 +113,6 @@ def study(data, needs: dict[str, np.ndarray], cfg: dict, k_values: list[int],
                 "capture_B": capture(z_b, z_b, ceiling, noise),
                 "capture_BN": capture(z_b, z_bn, ceiling, noise),
             })
-            say("М2", need=name, k=k, ceiling=round(ceiling, 1),
+            say("М2", need=name, k=requested, ceiling=round(ceiling, 1),
                 noise=round(noise, 1), above=ceiling > noise)
     return pd.DataFrame(rows), noise_sites

@@ -126,8 +126,8 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
 
     # --- M: максимальное покрытие ---
     with costs.stage("solve", "variant:M"):
-        solution = solver.solve_max_coverage(site_times, base, population, allowed,
-                                             k, cfg["T_minutes"])
+        solution = solver.solve_max_coverage_any(site_times, base, population, allowed,
+                                                 k, cfg["T_minutes"], cfg)
     results.append(VariantResult("M", solution.sites, objective=solution.objective,
                                  tie_count=solution.tie_count))
     say("вариант M", sites=list(solution.sites), ties=solution.tie_count)

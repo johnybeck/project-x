@@ -139,25 +139,80 @@ def test_bn_equal_to_b_is_a_result_not_a_duplicate(city, cfg):
     assert by_name["BN"].status == "ok" and "совпало с B" in by_name["BN"].note
 
 
+# --- шаг 2 (задачи 4.5–4.6 TODO_V2) ---
+
+def _step2_config(cfg):
+    city_cfg = {**NEED_CITY, "need": {**NEED_CITY["need"], "definitions": {
+        "age": {"adults_18_64": 1, "seniors_65": "r"},
+        "age_r1": {"adults_18_64": 1, "seniors_65": 1}}}}
+    return {**cfg, "city": city_cfg,
+            "m2": {"k_values": [1, 2], "noise_draws": 4, "noise_amplitude": 0.1,
+                   "noise_percentile": 95}}
+
+
 def test_step2_writes_everything_needed_to_recompute(city, cfg, tmp_path):
     """Шаг 2: варианты, разницы и М2 по каждому k и определению N — на диск."""
     from seto.experiment.step2 import run_step2
 
     _with_groups(city, adults=[100.0, 0, 0, 0], seniors=[0, 0, 500.0, 500.0])
-    city_cfg = {**NEED_CITY, "need": {**NEED_CITY["need"], "definitions": {
-        "age": {"adults_18_64": 1, "seniors_65": "r"},
-        "age_r1": {"adults_18_64": 1, "seniors_65": 1}}}}
-    full = {**cfg, "city": city_cfg, "t_max_minutes": 60,
-            "m2": {"k_values": [1, 2], "noise_draws": 4, "noise_amplitude": 0.1,
-                   "noise_percentile": 95}}
-    paths = run_step2(city, full, tmp_path)
+    paths = run_step2(city, _step2_config(cfg), tmp_path)
+    for path in paths.values():
+        assert path.exists()
+
     m2 = pd.read_csv(paths["m2"])
     assert len(m2) == 4 and set(m2["k"]) == {1, 2}
     assert m2.loc[(m2.need == "age") & (m2.k == 2), "BN_sites"].iloc[0] == "[0, 2]"
+    assert m2["k_used"].equals(m2["k"])
+
+
+def test_step2_compares_all_variants_at_every_k(city, cfg, tmp_path):
+    """A, B, M и BN — при каждом k, а не только при основном."""
+    from seto.experiment.step2 import run_step2
+
+    _with_groups(city, adults=[100.0, 0, 0, 0], seniors=[0, 0, 500.0, 500.0])
+    paths = run_step2(city, _step2_config(cfg), tmp_path)
+
     metrics = pd.read_csv(paths["metrics"])
-    assert {"B", "M", "BN"} <= set(metrics["variant"])   # у A строки нет: только распределение
-    for path in paths.values():
-        assert path.exists()
+    for k in (1, 2):
+        assert {"B", "M", "BN"} <= set(metrics.loc[metrics.k == k, "variant"])
+    table = pd.read_csv(paths["coverage_by_k"]).set_index("k")
+    assert list(table.index) == [1, 2]
+    assert {"A_median", "A_p95", "B", "BN", "M"} <= set(table.columns)
+    assert table.loc[2, "M"] >= table.loc[1, "M"]        # больше точек — не хуже
+    assert set(pd.read_parquet(paths["random_A"])["k"]) == {1, 2}
+
+
+def test_step2_above_two_uses_k_sites_for_every_variant(cfg, tmp_path):
+    """При k > 2 ни один вариант не должен тихо вернуть пару."""
+    from seto.experiment.step2 import run_step2
+
+    rng = np.random.default_rng(0)
+    cells, sites = 30, 12
+    grid = gpd.GeoDataFrame({"cell_id": [f"c{i}" for i in range(cells)]},
+                            geometry=[box(i, 0, i + 1, 1) for i in range(cells)],
+                            crs=UTM)
+    allowed = np.ones((sites, sites), dtype=bool)
+    np.fill_diagonal(allowed, False)
+    population = rng.uniform(10, 1000, cells)
+    base = rng.uniform(10, 59, cells)
+    data = FakeCity(grid=grid, features=pd.DataFrame({"cell_id": grid["cell_id"]}),
+                    population=population,
+                    clinics=gpd.GeoDataFrame(geometry=[Point(0, 0)], crs=UTM),
+                    base_times=base, clinic_times=base[None, :],
+                    site_times=rng.uniform(1, 59, (sites, cells)),
+                    site_index=np.arange(sites), allowed_pairs=allowed, report={})
+    data.groups = pd.DataFrame({"adults_18_64": population * 0.7,
+                                "seniors_65": population * rng.uniform(0, 0.3, cells)})
+    full = _step2_config(cfg)
+    full["m2"]["k_values"] = [3]
+    full["swap_heuristic"] = {"starts": 3, "max_iterations": 50}
+    paths = run_step2(data, full, tmp_path)
+
+    import json
+    solved = {v["variant"]: v["sites"]
+              for v in json.loads(paths["solutions"].read_text("utf-8"))["3"]}
+    assert all(len(solved[name]) == 3 for name in ("B", "BN", "M"))
+    assert len(pd.read_parquet(paths["random_A"])) == cfg["random_draws"]
 
 
 def test_identical_solution_marked_as_duplicate(city, cfg):

@@ -101,10 +101,21 @@ def _best_pair(score_pair, count: int, allowed: np.ndarray,
     return best_pair, float(best_value), evaluated, ties
 
 
+def _exhaustive_only(k: int) -> None:
+    """Полный перебор умеет только k ≤ 2 — иначе ошибка, а не тихая пара."""
+    if k > 2:
+        raise ValueError(f"полный перебор считается при k ≤ 2, а не {k}: "
+                         "для больших k есть solve_*_any")
+
+
 def solve_pmedian(site_times: np.ndarray, base_times: np.ndarray,
                   weights: np.ndarray, allowed: np.ndarray, k: int,
                   variant: str = "B") -> Solution:
-    """S* = argmin Σ w_i · t_i(S). Веса задают вариант: B, C или D (п. 10.1)."""
+    """S* = argmin Σ w_i · t_i(S). Веса задают вариант: B, C или D (п. 10.1).
+
+    Полный перебор — только при k ≤ 2: дальше он перебирал бы пары и молча
+    вернул две площадки вместо k. При больших k — solve_pmedian_any."""
+    _exhaustive_only(k)
     gain = _improvement(site_times, base_times) * weights[None, :]
 
     if k == 1:
@@ -190,6 +201,24 @@ def solve_pmedian_swap(site_times: np.ndarray, base_times: np.ndarray,
     перебора). В spread — цели всех стартов: если они сильно расходятся,
     стартов мало или задача рельефная, и это видно в отчёте."""
     gain = _improvement(site_times, base_times) * weights[None, :]
+    return _swap_multistart(gain, allowed, k, variant, starts, seed, max_iterations)
+
+
+def solve_max_coverage_swap(site_times: np.ndarray, base_times: np.ndarray,
+                            population: np.ndarray, allowed: np.ndarray, k: int,
+                            threshold: float, starts: int = 20, seed: int = 0,
+                            max_iterations: int = 1000) -> Solution:
+    """Максимальное покрытие при любом k той же эвристикой обмена.
+
+    Покрытие устроено так же, как выигрыш p-median: клетка считается один раз,
+    за лучшую площадку набора, Σ_i max_{j∈S} P_i·new_ij. Поэтому поиск общий."""
+    gain = _newly_covered(site_times, base_times, threshold) * population[None, :]
+    return _swap_multistart(gain, allowed, k, "M", starts, seed, max_iterations)
+
+
+def _swap_multistart(gain: np.ndarray, allowed: np.ndarray, k: int, variant: str,
+                     starts: int, seed: int, max_iterations: int) -> Solution:
+    """Обмен с нескольких случайных стартов: лучший набор и разброс целей."""
     rng = np.random.default_rng(seed)
     results = []
     for _ in range(starts):
@@ -225,11 +254,32 @@ def solve_pmedian_any(site_times: np.ndarray, base_times: np.ndarray,
     же решателем, иначе разница между ними мерила бы и разницу решателей."""
     if k <= 2:
         return solve_pmedian(site_times, base_times, weights, allowed, k, variant)
-    params = cfg.get("swap_heuristic") or {}
     return solve_pmedian_swap(site_times, base_times, weights, allowed, k, variant,
-                              starts=params.get("starts", 20),
-                              seed=cfg.get("seed", 0),
-                              max_iterations=params.get("max_iterations", 1000))
+                              **_swap_parameters(cfg))
+
+
+def solve_max_coverage_any(site_times: np.ndarray, base_times: np.ndarray,
+                           population: np.ndarray, allowed: np.ndarray, k: int,
+                           threshold: float, cfg: dict) -> Solution:
+    """Максимальное покрытие при любом k: k ≤ 2 — перебор, иначе обмен."""
+    if k <= 2:
+        return solve_max_coverage(site_times, base_times, population, allowed, k,
+                                  threshold)
+    return solve_max_coverage_swap(site_times, base_times, population, allowed, k,
+                                   threshold, **_swap_parameters(cfg))
+
+
+def _swap_parameters(cfg: dict) -> dict:
+    """Параметры эвристики из конфига — одни на все варианты."""
+    params = cfg.get("swap_heuristic") or {}
+    return {"starts": params.get("starts", 20), "seed": cfg.get("seed", 0),
+            "max_iterations": params.get("max_iterations", 1000)}
+
+
+def _newly_covered(site_times: np.ndarray, base_times: np.ndarray,
+                   threshold: float) -> np.ndarray:
+    """Клетки, которые площадка покрывает ДОПОЛНИТЕЛЬНО к существующей сети."""
+    return (site_times <= threshold) & ~(base_times <= threshold)[None, :]
 
 
 def solve_max_coverage(site_times: np.ndarray, base_times: np.ndarray,
@@ -238,10 +288,9 @@ def solve_max_coverage(site_times: np.ndarray, base_times: np.ndarray,
     """S* = argmax Σ P_i · 1[t_i(S) ≤ T] (п. 10.2).
 
     M прямо оптимизирует оцениваемую метрику, поэтому служит верхней границей
-    прироста покрытия, а не рядовым конкурентом."""
-    base_covered = base_times <= threshold
-    # клетки, которые площадка покрывает ДОПОЛНИТЕЛЬНО к существующей сети
-    new = (site_times <= threshold) & ~base_covered[None, :]
+    прироста покрытия, а не рядовым конкурентом. Перебор — только при k ≤ 2."""
+    _exhaustive_only(k)
+    new = _newly_covered(site_times, base_times, threshold)
     weighted = new * population[None, :]
 
     if k == 1:
@@ -273,6 +322,8 @@ def random_sets(allowed: np.ndarray, k: int, draws: int, seed: int,
     if k == 1:
         picks = rng.choice(count, size=min(draws, count), replace=False)
         return [(int(p),) for p in picks]
+    if k > 2:
+        return _random_large_sets(allowed, k, draws, rng, max_attempts_factor)
 
     found: set[tuple[int, ...]] = set()
     for _ in range(draws * max_attempts_factor):
@@ -289,6 +340,27 @@ def random_sets(allowed: np.ndarray, k: int, draws: int, seed: int,
             return sorted(every)
         picks = rng.choice(len(every), size=draws, replace=False)
         return sorted(every[int(i)] for i in picks)
+    return sorted(found)
+
+
+def _random_large_sets(allowed: np.ndarray, k: int, draws: int,
+                       rng: np.random.Generator,
+                       max_attempts_factor: int) -> list[tuple[int, ...]]:
+    """Случайные допустимые наборы при k > 2: выборка с отказом.
+
+    Запасного перечисления, как у пар, здесь нет: наборов слишком много.
+    Поэтому недобор — ошибка, а не укороченное распределение."""
+    found: set[tuple[int, ...]] = set()
+    for _ in range(draws * max_attempts_factor):
+        if len(found) >= draws:
+            break
+        picks = rng.choice(len(allowed), size=k, replace=False)
+        # диагональ матрицы ложна, поэтому допустимый набор даёт ровно k(k−1)
+        if allowed[np.ix_(picks, picks)].sum() == k * (k - 1):
+            found.add(tuple(sorted(int(p) for p in picks)))
+    if len(found) < draws:
+        raise ValueError(f"набрано {len(found)} случайных допустимых наборов "
+                         f"размера {k} из {draws}")
     return sorted(found)
 
 

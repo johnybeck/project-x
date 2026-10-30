@@ -325,6 +325,55 @@ def test_swap_fails_loudly_when_k_sites_cannot_be_separated():
         SV.solve_pmedian_swap(site_times, base, weights, allowed, k=2)
 
 
+def test_exhaustive_refuses_k_above_two_instead_of_returning_a_pair():
+    """Перебор идёт по парам: при k = 3 он молча вернул бы две площадки."""
+    site_times, base, weights, allowed = _random_city(0)
+    with pytest.raises(ValueError, match="k ≤ 2"):
+        SV.solve_pmedian(site_times, base, weights, allowed, k=3)
+    with pytest.raises(ValueError, match="k ≤ 2"):
+        SV.solve_max_coverage(site_times, base, weights, allowed, 3, 15)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_coverage_swap_matches_exhaustive_at_k2(seed):
+    site_times, base, weights, allowed = _random_city(seed)
+    exact = SV.solve_max_coverage(site_times, base, weights, allowed, 2, 15)
+    swap = SV.solve_max_coverage_swap(site_times, base, weights, allowed, 2, 15)
+    assert swap.objective == pytest.approx(exact.objective, rel=1e-12)
+
+
+def test_coverage_swap_matches_ilp_at_k3():
+    site_times, base, weights, allowed = _random_city(1, sites=12, cells=30)
+    ilp = SV.solve_ilp(site_times, base, weights, allowed, k=3, threshold=15)
+    swap = SV.solve_max_coverage_swap(site_times, base, weights, allowed, 3, 15)
+    assert swap.objective == pytest.approx(ilp.objective, rel=1e-9)
+
+
+def test_coverage_any_returns_k_sites_above_two():
+    site_times, base, weights, allowed = _random_city(2)
+    cfg = {"seed": 0, "swap_heuristic": {"starts": 5, "max_iterations": 100}}
+    solution = SV.solve_max_coverage_any(site_times, base, weights, allowed, 4, 15, cfg)
+    assert len(solution.sites) == 4 and solution.variant == "M"
+    FS.validate(solution.sites, allowed, expected_k=4)
+
+
+def test_random_sets_above_two_are_valid_unique_and_reproducible():
+    distances = np.full((12, 12), 900.0)
+    distances[0, 1] = distances[1, 0] = 100.0     # эта пара запрещена
+    allowed = _allowed(distances)
+    sets = SV.solve_random(allowed, k=5, draws=50, seed=3)
+    assert len(sets) == 50 == len(set(sets))
+    assert not any({0, 1} <= set(s) for s in sets)
+    assert sets == SV.solve_random(allowed, k=5, draws=50, seed=3)
+
+
+def test_random_sets_above_two_refuse_a_short_distribution():
+    """Наборов меньше, чем просят, — ошибка: укороченное A исказило бы процентиль."""
+    allowed = _allowed(np.full((4, 4), 900.0))        # троек всего четыре
+    with pytest.raises(ValueError, match="случайных допустимых"):
+        SV.random_sets(allowed, k=3, draws=10, seed=0)
+
+
 def test_one_entry_point_picks_solver_by_k():
     """k ≤ 2 — точный перебор, k > 2 — обмен; варианты решаются одним путём."""
     site_times, base, weights, allowed = _random_city(5)

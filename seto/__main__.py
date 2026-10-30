@@ -473,11 +473,13 @@ def cmd_step2(args: argparse.Namespace) -> int:
         run.record_output(costs.save(run.dir / "costs.json"))
         logger.close()
 
-    table = pd.read_csv(paths["m2"])
+    number = {"float_format": lambda v: f"{v:.2f}"}
+    print()
+    print(pd.read_csv(paths["coverage_by_k"]).to_string(index=False, **number))
     columns = ["need", "k", "same_sites", "ceiling_per_1000", "noise_per_1000",
                "above_noise"]
     print()
-    print(table[columns].to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.read_csv(paths["m2"])[columns].to_string(index=False, **number))
     print(f"\nрезультаты: {run.dir}")
     return 0
 
@@ -709,11 +711,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default=None)
     p.set_defaults(func=cmd_log_human)
 
-    p = sub.add_parser("step2", help="шаг 2: A, B, M, BN и М2 без снимков")
-    p.add_argument("city")
-    p.add_argument("prepared_run", help="папка прогона prepare-city")
-    p.set_defaults(func=cmd_step2)
-
     p = sub.add_parser("sensitivity", help="устойчивость к T, k, alpha")
     p.add_argument("city")
     p.add_argument("run_dir")
@@ -725,6 +722,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--protocol", default=None)
     p.add_argument("--raw", nargs="*", default=None)
     p.set_defaults(func=cmd_package_results)
+
+    p = sub.add_parser("step2", help="шаг 2: A, B, M, BN и М2 без снимков")
+    p.add_argument("city")
+    p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.set_defaults(func=cmd_step2)
 
     p = sub.add_parser("acquire-imagery", help="снимки по клеткам (нужен Л6)")
     p.add_argument("city")
