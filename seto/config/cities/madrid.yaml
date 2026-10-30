@@ -60,6 +60,21 @@ sources:
       file: "adrh_31097_income.csv"
       license: "INE, открытые данные"
       note: "ADRH, табл. 31097 «Indicadores de renta media y mediana»"
+    # Здания кадастра: год постройки для текста C и эталона эпохи М4 (MADRID_DATA
+    # п. 8). Условия: свободно для своих нужд и для новых продуктов после
+    # преобразования; исходный файл передавать и публиковать нельзя.
+    catastro_buildings:
+      url: "https://www.catastro.hacienda.gob.es/INSPIRE/Buildings/28/28900-MADRID/A.ES.SDGC.BU.28900.zip"
+      file: "catastro/A.ES.SDGC.BU.28900.zip"
+      license: "Licencia INSPIRE D.G. del Catastro, v1.0 (07.2016); автор и владелец данных — D.G. del Catastro"
+      note: "INSPIRE Buildings, муниципалитет Мадрид (код кадастра 28900), файл от 21.08.2026"
+
+# Год постройки жилых зданий (пропозал v2, п. 3.5). В OSM он есть у 13 зданий из
+# 69 180, поэтому источник — кадастр; отступление от «текста из OSM» идёт в протокол.
+building_years:
+  table: catastro_buildings        # имя из sources.tables
+  crs: 25830                       # проекция файла, ETRS89 / UTM 30N
+  residential_use: "1_residential" # значение currentUse у жилых зданий
 
 # Базовая сеть из реестра (пропозал v2, п. 3.2: центры здоровья — взрослая
 # первичная помощь государственной сети). Правила — здесь, чтобы их можно было

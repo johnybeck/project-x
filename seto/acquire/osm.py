@@ -62,8 +62,9 @@ def parse_other_tags(value: str | None) -> dict[str, str]:
     Выглядит так: "amenity"=>"pharmacy","opening_hours"=>"24/7"
     Драйвер продвигает в колонки только часть тегов, остальные складывает сюда.
     Значения могут содержать запятые и экранированные кавычки, поэтому разбор
-    посимвольный, а не split по запятой."""
-    if not value:
+    посимвольный, а не split по запятой. Пропуск в таблице приходит как NaN
+    (float), поэтому проверяется тип, а не просто пустота."""
+    if not isinstance(value, str) or not value:
         return {}
 
     tags: dict[str, str] = {}

@@ -20,6 +20,7 @@ from .. import settings
 from ..acquire.osm import describe_layers
 from ..costs.timer import SHARED, CostLog
 from ..data import boundary as boundary_mod
+from ..data import catastro as catastro_mod
 from ..data import clinics as clinics_mod
 from ..data import demography as demography_mod
 from ..data import features as features_mod
@@ -166,6 +167,19 @@ def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame):
     return transfer
 
 
+def _homes(cfg: dict, raw: Path, crs) -> gpd.GeoDataFrame | None:
+    """Жилые здания с годом постройки; None, если источник у города не задан:
+    тогда в тексте варианта C про год будет «нет данных»."""
+    rules = cfg["city"].get("building_years")
+    if not rules:
+        return None
+    path = raw / cfg["city"]["sources"]["tables"][rules["table"]]["file"]
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"нет {path}. Сначала `python -m seto acquire {cfg['city']['name']}`")
+    return catastro_mod.read(path, rules).to_crs(crs)
+
+
 def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                  costs: CostLog | None = None) -> CityData:
     """Собрать все общие данные города."""
@@ -212,8 +226,12 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         say("население", total=int(population.sum()),
             loss=transfer.loss_share)
 
-    with costs.stage("features", SHARED):
-        features = features_mod.build(grid, layers, roads, points)
+    with costs.stage("features", SHARED) as extra:
+        homes = _homes(cfg, raw, crs)
+        features = features_mod.build(grid, layers, roads, points, homes)
+        if homes is not None:
+            extra.update({"homes": len(homes),
+                          "homes_with_year": int(homes["year"].notna().sum())})
         say("признаки", columns=len(features.columns))
 
     with costs.stage("clinics", SHARED) as extra:

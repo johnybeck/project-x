@@ -257,6 +257,75 @@ def test_barrier_shares_are_separate():
     assert result["landuse_railway_share"].iloc[0] == 0.0
 
 
+def _homes(*specs):
+    """specs: (год или None, точка)."""
+    return gpd.GeoDataFrame({"year": [s[0] for s in specs]},
+                            geometry=[s[1] for s in specs], crs=UTM)
+
+
+def test_homes_are_counted_by_epoch_borders():
+    """Те же классы, что в промпте: 1955 уже не «до 1955», 2000 ещё не «после 2000»."""
+    grid = make_grid(cols=1)
+    inside = Point(400_100, 6_199_600)
+    years = (1954, 1955, 1974, 1975, 2000, 2001, None)
+    result = F.build(grid, {}, None, None, _homes(*[(y, inside) for y in years]))
+    row = result.iloc[0]
+    assert row["epoch_before_1955"] == 1
+    assert row["epoch_1955_1975"] == 2
+    assert row["epoch_1975_2000"] == 2
+    assert row["epoch_after_2000"] == 1
+    assert row["epoch_unknown"] == 1
+
+
+def test_homes_land_in_their_own_cell():
+    grid = make_grid(cols=2)
+    homes = _homes((1960, Point(400_700, 6_199_600)))
+    result = F.build(grid, {}, None, None, homes)
+    assert result["epoch_1955_1975"].tolist() == [0, 1]
+    assert result["epoch_before_1955"].tolist() == [0, 0]
+
+
+def test_homes_outside_the_city_give_zeros():
+    result = F.build(make_grid(cols=1), {}, None, None,
+                     _homes((1960, Point(300_000, 6_000_000))))
+    assert result["epoch_1955_1975"].tolist() == [0]
+
+
+def test_no_year_source_is_a_gap_not_a_zero():
+    """Нет источника и нет зданий — разное: первое не должно выглядеть нулём."""
+    result = F.build(make_grid(cols=1), {}, None, None)
+    assert result["epoch_before_1955"].isna().all()
+    assert result["epoch_unknown"].isna().all()
+
+
+def _shops(*specs):
+    """specs: (shop, other_tags, точка)."""
+    return gpd.GeoDataFrame(
+        {"amenity": None, "public_transport": None, "highway": None,
+         "shop": [s[0] for s in specs], "other_tags": [s[1] for s in specs]},
+        geometry=[s[2] for s in specs], crs=UTM)
+
+
+def test_chain_shops_list_frequent_brands_first():
+    grid = make_grid(cols=2)
+    inside = Point(400_100, 6_199_600)
+    points = _shops(("supermarket", '"brand"=>"Lidl"', inside),
+                    ("convenience", '"brand"=>"Dia"', inside),
+                    ("supermarket", '"brand"=>"Dia"', inside),
+                    ("supermarket", None, inside),
+                    ("clothes", '"brand"=>"Zara"', inside))
+    result = F.build(grid, {}, None, points)
+    assert result["shops"].tolist() == [4, 0]
+    assert result["chain_shops"].tolist() == [3, 0]
+    assert result["chain_brands"].tolist() == ["Dia — 2, Lidl — 1", ""]
+
+
+def test_no_brands_at_all_gives_zero_chains():
+    grid = make_grid(cols=1)
+    result = F.build(grid, {}, None, _shops(("supermarket", None, Point(400_100, 6_199_600))))
+    assert result["chain_shops"].tolist() == [0]
+
+
 def test_points_are_counted_per_cell():
     grid = make_grid(cols=2)
     points = gpd.GeoDataFrame(

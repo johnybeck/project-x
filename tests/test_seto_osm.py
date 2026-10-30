@@ -40,6 +40,8 @@ def test_escaped_quote_inside_value():
 def test_empty_and_none():
     assert parse_other_tags(None) == {}
     assert parse_other_tags("") == {}
+    # в таблице пропуск приходит как NaN — это float, а не None
+    assert parse_other_tags(float("nan")) == {}
 
 
 def test_cyrillic_values():

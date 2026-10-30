@@ -15,6 +15,8 @@ import hashlib
 
 import pandas as pd
 
+from ..data.features import EPOCH_UNKNOWN, EPOCHS
+
 UNKNOWN = "не определить"
 
 # Подоценки и допустимые ответы. Текст тех же меток — в TEMPLATE: разбор ответа
@@ -93,8 +95,10 @@ def diff() -> dict:
 
 # --- текст варианта C ---
 
-TEXT_TEMPLATE_VERSION = "1.0"
+TEXT_TEMPLATE_VERSION = "1.1"
 _MISSING = "нет данных"
+_EPOCH_COLUMNS = (*((column, label) for column, label, _ in EPOCHS),
+                  (EPOCH_UNKNOWN, "год неизвестен"))
 
 
 def _number(value, digits: int = 0) -> str:
@@ -111,8 +115,27 @@ def _percent(value) -> str:
     return f"{100 * float(value):.0f} %"
 
 
+def _epochs(row) -> str:
+    """Жилые здания по эпохам в процентах: без числа зданий, потому что здание
+    кадастра — это участок и с числом зданий OSM в том же тексте оно не сходится."""
+    counts = [row.get(column) for column, _ in _EPOCH_COLUMNS]
+    if any(value is None or pd.isna(value) for value in counts) or not sum(counts):
+        return _MISSING
+    return ", ".join(f"{label} — {100 * count / sum(counts):.0f} %"
+                     for (_, label), count in zip(_EPOCH_COLUMNS, counts))
+
+
+def _chains(row) -> str:
+    """Сколько магазинов с брендом сети и каких. Ноль здесь значит «бренд не
+    указан», а не «сетей нет»: тег стоит не у всех магазинов."""
+    count = row.get("chain_shops")
+    if count is None or pd.isna(count):
+        return _MISSING
+    return f"{int(count)} ({row['chain_brands']})" if count else "0"
+
+
 def describe(row) -> str:
-    """Детерминированное описание клетки из признаков OSM (п. 7.3).
+    """Детерминированное описание клетки из её признаков (п. 7.3).
 
     Населения в тексте НЕТ: оно уже входит в вес w_i = P_i·(1 + α·ŝ_i),
     а модель не должна считать числа."""
@@ -125,10 +148,12 @@ def describe(row) -> str:
         f"Зданий: {_number(row.get('buildings_count'))}, "
         f"средняя этажность {levels} "
         f"(этажность известна у {_percent(row.get('levels_known_share'))} зданий). "
+        f"Жилые здания по году постройки: {_epochs(row)}. "
         f"Школы: {_number(row.get('schools'))}, "
         f"детские сады: {_number(row.get('kindergartens'))}, "
         f"аптеки: {_number(row.get('pharmacies'))}, "
         f"магазины: {_number(row.get('shops'))}, "
+        f"из них с брендом сети: {_chains(row)}, "
         f"остановки транспорта: {_number(row.get('transport_stops'))}. "
         f"Парки и зелень: {_percent(row.get('green_share'))}, "
         f"вода: {_percent(row.get('water_share'))}, "

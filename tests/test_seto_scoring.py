@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from seto import settings  # noqa: E402
+from seto.data import features as F  # noqa: E402
 from seto.experiment.runner import sample_cells  # noqa: E402
 from seto.scoring import client as CL, prompt as P, rules as R, weights as W  # noqa: E402
 
@@ -115,6 +116,46 @@ def test_missing_values_say_so_explicitly():
 
 def test_description_is_deterministic():
     assert P.describe(_row()) == P.describe(_row())
+
+
+_EPOCH_ROW = {"epoch_before_1955": 1, "epoch_1955_1975": 2, "epoch_1975_2000": 0,
+              "epoch_after_2000": 0, "epoch_unknown": 1}
+
+
+def test_description_has_epochs_in_prompt_classes():
+    """Те же классы, что модель выбирает в ответе: иначе эпоху пришлось бы вычислять."""
+    text = P.describe(_row(**_EPOCH_ROW))
+    assert ("Жилые здания по году постройки: до 1955 — 25 %, 1955-1975 — 50 %, "
+            "1975-2000 — 0 %, после 2000 — 0 %, год неизвестен — 25 %.") in text
+
+
+def test_epochs_match_prompt_classes():
+    labels = [label for _, label, _ in F.EPOCHS]
+    assert labels == [r for r in P.RATINGS["epoch"] if r != P.UNKNOWN]
+
+
+@pytest.mark.parametrize("overrides", [
+    {},                                   # у города нет источника года
+    {column: np.nan for column in _EPOCH_ROW},
+    {column: 0 for column in _EPOCH_ROW},  # жилых зданий в кадастре нет
+])
+def test_epochs_missing_say_so(overrides):
+    text = P.describe(_row(**overrides))
+    assert "Жилые здания по году постройки: нет данных." in text
+
+
+def test_description_names_chains():
+    text = P.describe(_row(chain_shops=3, chain_brands="Dia — 2, Lidl — 1"))
+    assert "магазины: 5, из них с брендом сети: 3 (Dia — 2, Lidl — 1)," in text
+
+
+def test_zero_chains_have_no_empty_brackets():
+    text = P.describe(_row(chain_shops=0, chain_brands=""))
+    assert "из них с брендом сети: 0," in text
+
+
+def test_unknown_chains_say_so():
+    assert "из них с брендом сети: нет данных," in P.describe(_row())
 
 
 # --- разбор ответа ---

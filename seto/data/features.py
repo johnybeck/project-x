@@ -13,12 +13,26 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+from ..acquire.osm import parse_other_tags
+
 # какие building=* считаем жилыми и общественными (п. 3.1: «жилая или
 # общественная застройка»)
 RESIDENTIAL = ("apartments", "house", "detached", "residential", "dormitory",
                "terrace", "semidetached_house")
 PUBLIC = ("commercial", "office", "retail", "public", "civic", "school",
           "hospital", "university", "kindergarten")
+
+# Магазины для текста варианта C: продуктовые, по их сетям виден район
+SHOPS = ("supermarket", "convenience")
+
+# Эпохи жилых зданий: те же классы, что в вопросе epoch промпта, границы одни
+# для текста C и эталона М4. (колонка, подпись, первый год класса); 1955 уже не
+# «до 1955», 2000 ещё не «после 2000».
+EPOCHS = (("epoch_before_1955", "до 1955", None),
+          ("epoch_1955_1975", "1955-1975", 1955),
+          ("epoch_1975_2000", "1975-2000", 1975),
+          ("epoch_after_2000", "после 2000", 2001))
+EPOCH_UNKNOWN = "epoch_unknown"
 
 
 def _area_share(cells: gpd.GeoDataFrame, polygons: gpd.GeoDataFrame,
@@ -79,11 +93,54 @@ def _all_poi(points: gpd.GeoDataFrame,
     return gpd.GeoDataFrame(joined, geometry="geometry", crs=points.crs)
 
 
+def _epochs(cells: gpd.GeoDataFrame, homes: gpd.GeoDataFrame | None) -> pd.DataFrame:
+    """Жилые здания клетки по эпохам: колонка на класс и на неизвестный год.
+
+    Нет источника года — пропуск, а не ноль зданий: это разные вещи."""
+    columns = [column for column, _, _ in EPOCHS] + [EPOCH_UNKNOWN]
+    if homes is None:
+        return pd.DataFrame(np.nan, index=cells.index, columns=columns)
+
+    starts = [first for _, _, first in EPOCHS[1:]]
+    known = homes["year"].notna()
+    epoch = pd.Series(EPOCH_UNKNOWN, index=homes.index)
+    epoch[known] = np.array(columns)[
+        np.searchsorted(starts, homes.loc[known, "year"], side="right")]
+    joined = gpd.sjoin(homes.assign(epoch=epoch)[["epoch", "geometry"]],
+                       cells[["cell_id", "geometry"]], how="inner", predicate="within")
+    counts = joined.groupby(["cell_id", "epoch"]).size().unstack(fill_value=0)
+    table = counts.reindex(index=cells["cell_id"], columns=columns, fill_value=0)
+    return table.astype("int64").set_axis(cells.index)
+
+
+def _chain_shops(cells: gpd.GeoDataFrame, shops: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Магазины клетки с тегом brand: сколько и какие, частые бренды первыми.
+
+    Тег есть у 41 % продуктовых магазинов Мадрида, так что это нижняя оценка."""
+    result = pd.DataFrame({"chain_shops": 0, "chain_brands": ""}, index=cells.index)
+    brands = shops["other_tags"].map(lambda tags: parse_other_tags(tags).get("brand"))
+    branded = shops.assign(brand=brands).dropna(subset=["brand"])
+    if branded.empty:
+        return result
+    joined = gpd.sjoin(branded[["brand", "geometry"]], cells[["cell_id", "geometry"]],
+                       how="inner", predicate="within")
+    counts = joined.groupby(["cell_id", "brand"]).size().rename("count").reset_index()
+    ordered = counts.sort_values(["count", "brand"], ascending=[False, True])
+    labels = ordered.assign(label=ordered["brand"] + " — " + ordered["count"].astype(str))
+    result["chain_shops"] = (cells["cell_id"].map(counts.groupby("cell_id")["count"].sum())
+                             .fillna(0).astype("int64"))
+    result["chain_brands"] = (cells["cell_id"].map(labels.groupby("cell_id")["label"]
+                                                   .agg(", ".join)).fillna(""))
+    return result
+
+
 def build(cells: gpd.GeoDataFrame, layers: dict, roads: gpd.GeoDataFrame,
-          points: gpd.GeoDataFrame) -> pd.DataFrame:
+          points: gpd.GeoDataFrame,
+          homes: gpd.GeoDataFrame | None = None) -> pd.DataFrame:
     """Таблица признаков: одна строка на клетку.
 
-    cells и все слои должны быть в одной метрической проекции."""
+    cells и все слои должны быть в одной метрической проекции. homes — жилые
+    здания с годом постройки (точки), если у города есть такой источник."""
     if cells.crs is None or cells.crs.is_geographic:
         raise ValueError("клетки должны быть в метрической проекции (UTM)")
     points = _all_poi(points, layers.get("poi_polygons"))
@@ -110,6 +167,7 @@ def build(cells: gpd.GeoDataFrame, layers: dict, roads: gpd.GeoDataFrame,
         features["buildings_count"] = 0
         features["mean_levels"] = np.nan
         features["levels_known_share"] = 0.0
+    features = features.join(_epochs(cells, homes).reset_index(drop=True))
 
     # --- препятствия: именно они отсекают клетку (п. 8) ---
     features["water_share"] = _area_share(cells, layers.get("water"),
@@ -128,13 +186,16 @@ def build(cells: gpd.GeoDataFrame, layers: dict, roads: gpd.GeoDataFrame,
                 ("schools", "amenity", ("school",)),
                 ("kindergartens", "amenity", ("kindergarten",)),
                 ("pharmacies", "amenity", ("pharmacy",)),
-                ("shops", "shop", ("supermarket", "convenience")),
+                ("shops", "shop", SHOPS),
                 ("transport_stops", "public_transport", ("platform",)),
         ):
             subset = points[points[column].isin(values)] if column in points else None
             features[name] = _count_within(cells, subset, name).to_numpy()
         bus = points[points["highway"] == "bus_stop"] if "highway" in points else None
         features["transport_stops"] += _count_within(cells, bus, "bus").to_numpy()
+        if {"shop", "other_tags"} <= set(points.columns):
+            chains = _chain_shops(cells, points[points["shop"].isin(SHOPS)])
+            features = features.join(chains.reset_index(drop=True))
 
     # --- плотность пешеходной сети ---
     features["street_density_m_per_km2"] = _street_density(cells, roads).to_numpy()
