@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..scoring.prompt import RATINGS
+
 
 def city_map(grid, clinics, site_index, population, base_times, cfg,
              out_path: Path, scores: pd.DataFrame | None = None) -> Path:
@@ -101,6 +103,11 @@ def solutions_map(grid, clinics, solutions: dict[str, tuple], site_index,
     return out_path
 
 
+def _ratings_line(row) -> str:
+    """Подоценки клетки одной строкой: скор без них не объяснить."""
+    return "; ".join(f"{name}: {row.get(name)}" for name in RATINGS)
+
+
 def cell_inspector(features: pd.DataFrame, texts: pd.Series,
                    scores: pd.DataFrame | None, out_path: Path,
                    sample: int = 20, seed: int = 0) -> Path:
@@ -122,8 +129,8 @@ def cell_inspector(features: pd.DataFrame, texts: pd.Series,
         score = row.get("score")
         blocks.append(
             f"<div class='cell'><h3>{row.cell_id}"
-            + (f" — скор {score:.0f}</h3>" if pd.notna(score) else "</h3>")
-            + (f"<p class='why'>{row.get('rationale', '')}</p>"
+            + (f" — скор {score:.1f}</h3>" if pd.notna(score) else "</h3>")
+            + (f"<p class='why'>{_ratings_line(row)}: {row.get('rationale', '')}</p>"
                if scores is not None else "")
             + f"<p class='text'>{row.text}</p></div>")
 

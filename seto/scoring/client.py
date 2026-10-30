@@ -22,7 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .prompt import build, prompt_hash
+from . import rules
+from .prompt import RATINGS, build, prompt_hash
 
 
 class ScoreSchemaError(ValueError):
@@ -56,8 +57,13 @@ class ScoringReport:
                 "failures": self.failures[:20]}
 
 
+def _label(value) -> str:
+    """Ответ в виде из списка: модели меняют регистр и тире в «1955–1975»."""
+    return str(value).strip().lower().replace("–", "-").replace("—", "-")
+
+
 def parse_response(raw: str | None) -> dict:
-    """Разобрать ответ и проверить по схеме {score: 0-10, rationale: str}.
+    """Разобрать ответ и проверить: все подоценки на месте, ответы из списка.
 
     Пустой content бывает у reasoning-моделей, когда рассуждение съело весь
     лимит токенов, — это ошибка разбора, а не «ноль»."""
@@ -76,16 +82,17 @@ def parse_response(raw: str | None) -> dict:
     except json.JSONDecodeError as error:
         raise ScoreSchemaError(f"невалидный JSON: {error}") from error
 
-    if "score" not in data:
-        raise ScoreSchemaError(f"в ответе нет поля score: {data}")
-    try:
-        score = int(data["score"])
-    except (TypeError, ValueError) as error:
-        raise ScoreSchemaError(f"score не целое: {data['score']!r}") from error
-    if not 0 <= score <= 10:
-        raise ScoreSchemaError(f"score вне шкалы 0-10: {score}")
+    parsed = {}
+    for name, allowed in RATINGS.items():
+        if name not in data:
+            raise ScoreSchemaError(f"в ответе нет поля {name}: {data}")
+        label = _label(data[name])
+        if label not in allowed:
+            raise ScoreSchemaError(f"{name}: ответа {data[name]!r} нет в списке")
+        parsed[name] = label
 
-    return {"score": score, "rationale": str(data.get("rationale", ""))}
+    parsed["rationale"] = str(data.get("rationale", ""))
+    return parsed
 
 
 def _input_hash(mode: str, payload: str | bytes) -> str:
@@ -184,12 +191,16 @@ def score_cells(cell_ids, inputs, mode: str, cfg: dict,
                 cache_dir: Path, raw_dir: Path | None = None):
     """Скоры по всем клеткам. inputs — тексты (mode='text') или байты (mode='image').
 
-    Возвращает (DataFrame[cell_id, score, rationale, imputed], ScoringReport)."""
+    Возвращает (DataFrame[cell_id, подоценки, rationale, imputed, score],
+    ScoringReport). Скор считается здесь, а не кэшируется: кэш хранит только
+    то, что сказала модель."""
     if mode not in ("text", "image"):
         raise ValueError(f"режим должен быть 'text' или 'image', а не {mode!r}")
     if len(cell_ids) != len(inputs):
         raise ValueError("число клеток и входов не совпадает")
 
+    # до первого вызова: ошибка в правиле не должна стоить прогона модели
+    rule = rules.active(cfg)
     vlm = cfg["vlm"]
     size_m = cfg["grid"]["size_m"]
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -246,13 +257,15 @@ def score_cells(cell_ids, inputs, mode: str, cfg: dict,
                 report.completion_tokens += parsed.get("completion_tokens", 0)
             if parsed is None:
                 report.failures.append(error)
-                rows.append({"cell_id": cell_id, "score": np.nan,
+                rows.append({"cell_id": cell_id, **dict.fromkeys(RATINGS),
                              "rationale": "", "imputed": True})
             else:
-                rows.append({"cell_id": cell_id, "score": parsed["score"],
+                rows.append({"cell_id": cell_id,
+                             **{name: parsed[name] for name in RATINGS},
                              "rationale": parsed["rationale"], "imputed": False})
 
     scores = pd.DataFrame(rows)
+    scores["score"] = rules.score(scores, rule)
     report.imputed = int(scores["imputed"].sum())
     report.seconds = time.time() - started
 

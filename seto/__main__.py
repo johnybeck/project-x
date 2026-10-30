@@ -575,9 +575,50 @@ def cmd_prompt_dev(args: argparse.Namespace) -> int:
     if scores is not None:
         values = scores["score"].to_numpy()
         print(f"скоры: {len(np.unique(values))} различных значений, "
-              f"медиана {np.median(values):.0f}, "
-              f"min {values.min():.0f}, max {values.max():.0f}")
+              f"медиана {np.median(values):.1f}, "
+              f"min {values.min():.1f}, max {values.max():.1f}")
     print(f"инспектор клеток: {out}")
+    return 0
+
+
+def cmd_score_sample(args: argparse.Namespace) -> int:
+    """Подоценки на нескольких клетках — проверка перед прогоном всего города."""
+    import pandas as pd
+
+    from .costs.timer import CostLog
+    from .experiment import runner
+    from .scoring import prompt as prompt_mod
+
+    cfg = config_mod.load(args.city)
+    runner.guard_test_city(cfg, None)
+    features = pd.read_parquet(Path(args.prepared_run) / "cell_features.parquet")
+    chosen = features[features["cell_id"].isin(
+        runner.sample_cells(features, args.cells, cfg["seed"]))]
+    cell_ids = chosen["cell_id"].tolist()
+
+    if args.mode == "text":
+        inputs = prompt_mod.describe_all(chosen).tolist()
+    else:
+        inputs = runner._load_images(runner._imagery_dir(cfg, args.city), cell_ids)
+        if inputs is None:
+            print(f"нет снимков клеток {cell_ids}", file=sys.stderr)
+            return 4
+
+    with Run.start(args.city, "score-sample", cfg) as run:
+        logger = RunLogger(run.run_id, run.dir / "log.jsonl")
+        values, report = runner._score_variant(args.mode, cell_ids, inputs, cfg,
+                                               run.dir, CostLog(), logger)
+        logger.close()
+    if values is None:
+        print(f"скоринг не удался: {report['reason']}", file=sys.stderr)
+        return 1
+
+    scores = pd.read_parquet(run.dir / f"scores_{args.mode}.parquet")
+    print(scores.drop(columns=["rationale", "imputed"]).to_string(index=False))
+    print(f"\nвызовов {report['api_calls']}, из кэша {report['from_cache']}, "
+          f"сбоев {report['imputed']}, "
+          f"токенов ответа {report['completion_tokens']}")
+    print(f"результаты: {run.dir}")
     return 0
 
 
@@ -751,6 +792,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_dir")
     p.add_argument("--sample", type=int, default=20)
     p.set_defaults(func=cmd_prompt_dev)
+
+    p = sub.add_parser("score-sample", help="подоценки на нескольких клетках")
+    p.add_argument("city")
+    p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.add_argument("--mode", choices=("text", "image"), default="text")
+    p.add_argument("--cells", type=int, default=1)
+    p.set_defaults(func=cmd_score_sample)
 
     p = sub.add_parser("profile-cities", help="профиль городов-кандидатов")
     p.set_defaults(func=cmd_profile_cities)

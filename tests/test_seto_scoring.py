@@ -9,7 +9,31 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from seto.scoring import client as CL, prompt as P, weights as W  # noqa: E402
+from seto import settings  # noqa: E402
+from seto.experiment.runner import sample_cells  # noqa: E402
+from seto.scoring import client as CL, prompt as P, rules as R, weights as W  # noqa: E402
+
+GLOBAL = settings.load_global()
+RULE = GLOBAL["score_rules"][GLOBAL["score_rule"]]
+
+
+def _answer(**overrides) -> dict:
+    """Правильный ответ модели; тесты меняют в нём только нужное поле."""
+    base = {"housing_type": "многоквартирные кварталы", "epoch": "1955-1975",
+            "housing_share": "больше половины", "construction": "нет",
+            "purpose": "жилое", "affluence": "средний",
+            "rationale": "плотная застройка"}
+    base.update(overrides)
+    return base
+
+
+def _scoring_cfg(retries: int = 1) -> dict:
+    return {"vlm": {"model": "m", "temperature": 0, "max_tokens": 10,
+                    "max_parallel": 1, "retries": retries,
+                    "base_url_env": "NO_URL", "api_key_env": "NO_KEY"},
+            "grid": {"size_m": 500},
+            "score_rule": GLOBAL["score_rule"],
+            "score_rules": GLOBAL["score_rules"]}
 
 
 # --- промпты ---
@@ -24,11 +48,25 @@ def test_prompts_differ_only_in_input_clause():
     assert "описание" in text
 
 
-def test_prompt_asks_one_question():
-    """Промпт спрашивает одно — нужна ли поликлиника (п. 7.1, решение Д12)."""
+def test_prompt_does_not_ask_about_need():
+    """Модель отмечает видимое; нуждаемость получается по правилу (п. 3.5)."""
     text = P.build("text", 500, "x").lower()
-    assert "поликлиника" in text
-    assert "wealth" not in text and "премиальн" not in text
+    for word in ("поликлиник", "нужд", "медицин", "score"):
+        assert word not in text
+
+
+def test_prompt_lists_every_allowed_answer():
+    """Разбор ответа строгий: метка, которой нет в промпте, — это сбой клетки."""
+    text = P.build("image", 500)
+    for name, labels in P.RATINGS.items():
+        assert f'"{name}"' in text
+        for label in labels:
+            assert f'"{label}"' in text
+
+
+def test_prompt_lets_the_model_decline():
+    """Эпоху по снимку можно не различить: угадывание хуже, чем отказ."""
+    assert all(P.UNKNOWN in labels for labels in P.RATINGS.values())
 
 
 def test_prompt_forbids_counting():
@@ -82,13 +120,20 @@ def test_description_is_deterministic():
 # --- разбор ответа ---
 
 def test_parses_plain_json():
-    assert CL.parse_response('{"score": 7, "rationale": "плотная застройка"}') == {
-        "score": 7, "rationale": "плотная застройка"}
+    assert CL.parse_response(json.dumps(_answer(), ensure_ascii=False)) == _answer()
 
 
 def test_parses_markdown_wrapped():
-    raw = '```json\n{"score": 3, "rationale": "окраина"}\n```'
-    assert CL.parse_response(raw)["score"] == 3
+    raw = f"```json\n{json.dumps(_answer(), ensure_ascii=False)}\n```"
+    assert CL.parse_response(raw)["epoch"] == "1955-1975"
+
+
+def test_dash_and_case_do_not_fail_a_cell():
+    """Модели пишут «1955–1975» с длинным тире: это та же метка, а не сбой."""
+    raw = json.dumps(_answer(epoch="1955–1975", affluence=" Средний "),
+                     ensure_ascii=False)
+    parsed = CL.parse_response(raw)
+    assert parsed["epoch"] == "1955-1975" and parsed["affluence"] == "средний"
 
 
 def test_empty_content_is_an_error_not_zero():
@@ -98,21 +143,30 @@ def test_empty_content_is_an_error_not_zero():
             CL.parse_response(value)
 
 
-def test_score_outside_scale_is_rejected():
-    with pytest.raises(CL.ScoreSchemaError, match="вне шкалы"):
-        CL.parse_response('{"score": 11}')
-    with pytest.raises(CL.ScoreSchemaError, match="вне шкалы"):
-        CL.parse_response('{"score": -1}')
+def test_label_outside_the_list_is_rejected():
+    raw = json.dumps(_answer(epoch="1960-е"), ensure_ascii=False)
+    with pytest.raises(CL.ScoreSchemaError, match="нет в списке"):
+        CL.parse_response(raw)
 
 
-def test_non_integer_score_is_rejected():
-    with pytest.raises(CL.ScoreSchemaError, match="не целое"):
-        CL.parse_response('{"score": "высокий"}')
+def test_number_instead_of_label_is_rejected():
+    raw = json.dumps(_answer(epoch=1960), ensure_ascii=False)
+    with pytest.raises(CL.ScoreSchemaError, match="нет в списке"):
+        CL.parse_response(raw)
 
 
-def test_missing_score_is_rejected():
-    with pytest.raises(CL.ScoreSchemaError, match="нет поля score"):
-        CL.parse_response('{"rationale": "что-то"}')
+def test_every_rating_is_required():
+    for name in P.RATINGS:
+        answer = _answer()
+        del answer[name]
+        with pytest.raises(CL.ScoreSchemaError, match=f"нет поля {name}"):
+            CL.parse_response(json.dumps(answer, ensure_ascii=False))
+
+
+def test_old_score_format_is_rejected():
+    """Ответ по старой схеме не должен тихо пройти как подоценки."""
+    with pytest.raises(CL.ScoreSchemaError, match="нет поля"):
+        CL.parse_response('{"score": 7, "rationale": "что-то"}')
 
 
 def test_broken_json_is_rejected():
@@ -141,19 +195,51 @@ def test_cache_key_depends_on_cell_model_and_prompt():
 
 def test_cached_cells_do_not_call_the_api(tmp_path):
     """Повторный запуск не ходит в API — он же даёт возобновление после обрыва."""
-    cfg = {"vlm": {"model": "m", "temperature": 0, "max_tokens": 10,
-                   "max_parallel": 1, "retries": 1,
-                   "base_url_env": "NO_URL", "api_key_env": "NO_KEY"},
-           "grid": {"size_m": 500}}
     cell_ids, texts = ["cell_000001"], ["описание"]
     prompt = P.build("text", 500, texts[0])
     key = CL.cache_key(cell_ids[0], "m", prompt, "text", texts[0])
     (tmp_path / f"{key}.json").write_text(
-        json.dumps({"score": 5, "rationale": "из кэша"}), encoding="utf-8")
+        json.dumps(_answer(epoch="до 1955"), ensure_ascii=False), encoding="utf-8")
 
-    scores, report = CL.score_cells(cell_ids, texts, "text", cfg, tmp_path)
-    assert scores["score"].iloc[0] == 5
+    scores, report = CL.score_cells(cell_ids, texts, "text", _scoring_cfg(), tmp_path)
+    assert scores["epoch"].iloc[0] == "до 1955"
+    assert scores["score"].iloc[0] == RULE["points"]["до 1955"]
     assert report.from_cache == 1 and report.api_calls == 0
+
+
+def test_every_rating_is_kept_for_m4(tmp_path):
+    """М4 сверяет эпоху и достаток с эталоном, поэтому они нужны по клеткам."""
+    prompt = P.build("text", 500, "x")
+    key = CL.cache_key("a", "m", prompt, "text", "x")
+    (tmp_path / f"{key}.json").write_text(
+        json.dumps(_answer(), ensure_ascii=False), encoding="utf-8")
+
+    scores, _ = CL.score_cells(["a"], ["x"], "text", _scoring_cfg(), tmp_path)
+    assert set(P.RATINGS) <= set(scores.columns)
+
+
+def test_old_prompt_cache_is_not_picked_up(tmp_path, monkeypatch):
+    """Ответ старого промпта лежит под старым хешем и не должен найтись."""
+    monkeypatch.setattr(CL, "_make_client", lambda _cfg: _BrokenClient())
+    old_prompt = "Вопрос один: насколько нужна поликлиника?"
+    key = CL.cache_key("a", "m", old_prompt, "text", "x")
+    (tmp_path / f"{key}.json").write_text(
+        json.dumps({"score": 7, "rationale": ""}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="ни одна клетка"):
+        CL.score_cells(["a"], ["x"], "text", _scoring_cfg(retries=0), tmp_path)
+
+
+def test_bad_rule_stops_before_any_model_call(tmp_path, monkeypatch):
+    """Ошибка в правиле не должна стоить прогона модели."""
+    def fail(_cfg):
+        raise AssertionError("дошли до вызова модели")
+
+    monkeypatch.setattr(CL, "_make_client", fail)
+    cfg = _scoring_cfg()
+    cfg["score_rules"] = {"age": {"rating": "housing_share", "points": {}}}
+    with pytest.raises(ValueError, match="не может входить"):
+        CL.score_cells(["a"], ["x"], "text", cfg, tmp_path)
 
 
 class _BrokenClient:
@@ -169,21 +255,18 @@ class _BrokenClient:
 def test_failed_cells_get_median_and_are_flagged(tmp_path, monkeypatch):
     """Сбойная клетка получает медиану города и флаг imputed (п. 7.1)."""
     monkeypatch.setattr(CL, "_make_client", lambda _cfg: _BrokenClient())
-    cfg = {"vlm": {"model": "m", "temperature": 0, "max_tokens": 10,
-                   "max_parallel": 1, "retries": 0,
-                   "base_url_env": "NO_URL", "api_key_env": "NO_KEY"},
-           "grid": {"size_m": 500}}
     ids = ["a", "b", "c"]
-    for cell_id, score in zip(ids[:2], (4, 8)):
+    for cell_id, epoch in zip(ids[:2], ("до 1955", "после 2000")):
         prompt = P.build("text", 500, cell_id)
         key = CL.cache_key(cell_id, "m", prompt, "text", cell_id)
         (tmp_path / f"{key}.json").write_text(
-            json.dumps({"score": score, "rationale": ""}), encoding="utf-8")
+            json.dumps(_answer(epoch=epoch), ensure_ascii=False), encoding="utf-8")
 
-    scores, report = CL.score_cells(ids, ids, "text", cfg, tmp_path)
+    scores, report = CL.score_cells(ids, ids, "text", _scoring_cfg(retries=0), tmp_path)
     assert report.imputed == 1                      # третья клетка не в кэше
-    assert scores.loc[scores.cell_id == "c", "score"].iloc[0] == 6.0
+    assert scores.loc[scores.cell_id == "c", "score"].iloc[0] == 1.5
     assert bool(scores.loc[scores.cell_id == "c", "imputed"].iloc[0])
+    assert scores.loc[scores.cell_id == "c", "epoch"].isna().all()
     assert report.failures and "модель недоступна" in report.failures[0]
 
 
@@ -191,12 +274,8 @@ def test_missing_credentials_fail_loudly(tmp_path, monkeypatch):
     """Отсутствие ключа — ошибка настройки, а не повод пометить всё imputed."""
     monkeypatch.delenv("NO_URL", raising=False)
     monkeypatch.delenv("NO_KEY", raising=False)
-    cfg = {"vlm": {"model": "m", "temperature": 0, "max_tokens": 10,
-                   "max_parallel": 1, "retries": 0,
-                   "base_url_env": "NO_URL", "api_key_env": "NO_KEY"},
-           "grid": {"size_m": 500}}
     with pytest.raises(RuntimeError, match="не заданы"):
-        CL.score_cells(["a"], ["текст"], "text", cfg, tmp_path)
+        CL.score_cells(["a"], ["текст"], "text", _scoring_cfg(retries=0), tmp_path)
 
 
 def test_too_many_imputed_fails_the_variant():
@@ -205,6 +284,65 @@ def test_too_many_imputed_fails_the_variant():
         CL.check_imputed(report, {"imputation_max_share": 0.05})
     CL.check_imputed(CL.ScoringReport(cells=100, imputed=5),
                      {"imputation_max_share": 0.05})
+
+
+# --- правило перевода подоценок в скор ---
+
+def test_config_rule_is_valid():
+    assert R.active(GLOBAL) is RULE
+
+
+def test_older_buildings_score_higher():
+    """Для N_возр скор растёт с возрастом застройки (п. 3.5)."""
+    points = RULE["points"]
+    assert (points["до 1955"] > points["1955-1975"] > points["1975-2000"]
+            > points["после 2000"])
+
+
+def test_unknown_epoch_sits_in_the_middle():
+    """Неизвестная эпоха не поднимает клетку и не опускает её."""
+    points = RULE["points"]
+    assert points[P.UNKNOWN] == (points["до 1955"] + points["после 2000"]) / 2
+
+
+def test_housing_share_cannot_enter_the_rule():
+    """Доля жилья — это население, а оно уже в P_i (п. 3.5)."""
+    rule = {"rating": "housing_share",
+            "points": dict.fromkeys(P.RATINGS["housing_share"], 1)}
+    with pytest.raises(ValueError, match="не может входить"):
+        R.check(rule)
+
+
+def test_rule_must_score_every_label():
+    points = {label: 1 for label in P.RATINGS["epoch"] if label != "до 1955"}
+    with pytest.raises(ValueError, match="до 1955"):
+        R.check({"rating": "epoch", "points": points})
+
+
+def test_rule_rejects_labels_the_model_never_returns():
+    points = dict.fromkeys(P.RATINGS["epoch"], 1) | {"1960-е": 1}
+    with pytest.raises(ValueError, match="1960-е"):
+        R.check({"rating": "epoch", "points": points})
+
+
+def test_unknown_rating_is_rejected():
+    with pytest.raises(ValueError, match="нет такой подоценки"):
+        R.check({"rating": "colour", "points": {}})
+
+
+def test_score_maps_labels_and_leaves_failures_empty():
+    ratings = pd.DataFrame({"epoch": ["до 1955", "после 2000", None]})
+    result = R.score(ratings, RULE)
+    assert result.iloc[:2].tolist() == [3.0, 0.0] and np.isnan(result.iloc[2])
+
+
+def test_sample_takes_inhabited_cells_and_grows_from_the_first():
+    """10 клеток включают ту одну, с которой начинали проверку."""
+    features = pd.DataFrame({"cell_id": list("abcdef"),
+                             "population": [0, 5, 0, 7, 9, 3]})
+    one, three = sample_cells(features, 1, 0), sample_cells(features, 3, 0)
+    assert one == three[:1]
+    assert set(three) <= {"b", "d", "e", "f"} and len(set(three)) == 3
 
 
 # --- веса спроса ---

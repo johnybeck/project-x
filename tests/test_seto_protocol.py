@@ -128,6 +128,19 @@ def test_verify_detects_changed_parameter(tmp_path, monkeypatch):
     assert any("параметр k" in p for p in result["problems"])
 
 
+def test_verify_detects_changed_score_rule(tmp_path, monkeypatch):
+    """Правило перевода задаётся до прогонов (п. 3.5): менять его после нельзя."""
+    monkeypatch.setattr(proto, "git_state",
+                        lambda: {"commit": "c1", "branch": "main", "dirty": False})
+    cfg = settings.load()
+    json_path, _ = proto.freeze(cfg, {"moscow": "dev"}, {}, tmp_path)
+
+    changed = settings.load()
+    changed["score_rules"]["age"]["points"]["до 1955"] = 2
+    result = proto.verify(json_path, changed)
+    assert any("score_rules" in p for p in result["problems"])
+
+
 def test_verify_detects_other_commit(tmp_path, monkeypatch):
     monkeypatch.setattr(proto, "git_state",
                         lambda: {"commit": "c1", "branch": "main", "dirty": False})

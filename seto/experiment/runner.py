@@ -41,6 +41,16 @@ def guard_test_city(cfg: dict, protocol_path: Path | None) -> None:
             "заморожен: сначала `python -m seto freeze-protocol`")
 
 
+def sample_cells(features: pd.DataFrame, count: int, seed: int) -> list[str]:
+    """Случайные заселённые клетки: проверка промпта на малом числе вызовов.
+
+    Сид один и тот же, поэтому 10 клеток включают ту единственную, с которой
+    начинали, а C и D смотрят на одни и те же клетки."""
+    inhabited = features.loc[features["population"] > 0, "cell_id"].to_numpy()
+    order = np.random.default_rng(seed).permutation(inhabited)
+    return order[:count].tolist()
+
+
 def _score_variant(mode: str, cell_ids, inputs, cfg: dict, run_dir: Path,
                    costs: CostLog, logger) -> tuple[np.ndarray | None, dict]:
     """Скоры одного варианта. Сбой не роняет город — вариант станет failed."""

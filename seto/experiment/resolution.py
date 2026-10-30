@@ -131,7 +131,7 @@ def agreement(scores: pd.DataFrame, reference_gsd: float) -> pd.DataFrame:
             "spearman": round(float(rho), 4),
             "mean_abs_shift": round(float(diff.mean()), 3),
             "share_shift_over_2": round(float((diff > 2).mean()), 4),
-            "max_shift": int(diff.max()),
+            "max_shift": float(diff.max()),
             "mean_score": round(float(both["value"].mean()), 3),
         })
     return pd.DataFrame(rows)
