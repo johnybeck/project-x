@@ -70,6 +70,34 @@ sources:
       license: "Licencia INSPIRE D.G. del Catastro, v1.0 (07.2016); автор и владелец данных — D.G. del Catastro"
       note: "INSPIRE Buildings, муниципалитет Мадрид (код кадастра 28900), файл от 21.08.2026"
 
+# Снимки варианта D: считается дважды, на высоком разрешении и на 10 м, как в городе
+# с бедными данными (пропозал v2, п. 3.8). Одна клетка — один файл, MADRID_DATA п. 4.
+imagery:
+  main_set: pnoa_25cm
+  input_px: 896                    # вход кодировщика модели, RESOLUTION_STUDY
+  sets:
+    pnoa_25cm:
+      type: wms
+      url: "https://www.ign.es/wms-inspire/pnoa-ma"
+      layer: "OI.OrthoimageCoverage"
+      info_layer: "OI.MosaicElement"
+      crs: 25830
+      gsd_m: 0.25
+      max_parallel: 3              # условия IGN не ограничивают, но сервер общий
+      license: "CC BY 4.0, scne.es (условия IGN, Orden FOM/2807/2015)"
+      attribution: "Obra derivada de PNOA 2023 CC-BY 4.0 scne.es"
+    # Настоящий снимок, а не огрублённый PNOA: на Люцерне они меняли решение по-разному.
+    # Сцена ближе всего к съёмке PNOA (07.2023): облачность 0,0009 %, тайл покрыт целиком,
+    # сетка города лежит внутри него. TCI — готовый 8-битный RGB, как на Люцерне.
+    s2_10m:
+      type: scene
+      url: "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/30/T/VK/2023/8/S2B_30TVK_20230801_0_L2A/TCI.tif"
+      file: "S2B_30TVK_20230801_TCI.tif"
+      capture_date: "2023-08-01"
+      gsd_m: 10
+      license: "Copernicus Sentinel data, открытая лицензия; AWS Open Data"
+      attribution: "Contains modified Copernicus Sentinel data 2023"
+
 # Здания с годом постройки и квартирами (пропозал v2, п. 3.5). В OSM год есть у
 # 13 зданий из 69 180, поэтому источник — кадастр; отступление от «текста из OSM»
 # идёт в протокол.
@@ -77,6 +105,19 @@ buildings:
   table: catastro_buildings        # имя из sources.tables
   crs: 25830                       # проекция файла, ETRS89 / UTM 30N
   residential_use: "1_residential" # значение currentUse у жилых зданий
+
+# Доход по участкам для сверки достатка (М4). Год — съёмки PNOA, 07.2023: в этом году
+# доход есть у 2448 участков из 2450, а коды совпадают с границами Secciones_2024.
+income:
+  table: income                    # имя из sources.tables
+  sep: ";"
+  encoding: "utf-8-sig"
+  section_column: Secciones
+  indicator_column: "Indicadores de renta media y mediana"
+  indicator: "Renta neta media por persona"
+  year_column: Periodo
+  year: 2023
+  value_column: Total
 
 # Базовая сеть из реестра (пропозал v2, п. 3.2: центры здоровья — взрослая
 # первичная помощь государственной сети). Правила — здесь, чтобы их можно было
@@ -186,6 +227,10 @@ population:
   # квартиру, у всех остальных не больше 5,3: любой порог от 5,3 до 15 даёт те же
   # три участка, поэтому от числа 6 результат не зависит.
   max_people_per_dwelling: 6
+
+# М4: меньше зданий — эпоха клетки случайна, эталона нет (metrics/perception.py).
+m4:
+  min_homes: 5
 
 # Сеть берётся из реестра (раздел registry выше), а не из OSM по названию:
 # русские правила глобального конфига здесь не нужны и не применяются.

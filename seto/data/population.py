@@ -159,6 +159,7 @@ class RegistryTransfer:
     report: dict
     main_section: pd.Series | None = None    # участок, давший клетке больше людей
     districts: pd.Series | None = None       # его район; заполняет prepare-city
+    by_section: pd.DataFrame | None = None   # cell_id, code, total: откуда жители клетки
 
     @property
     def per_cell(self) -> pd.Series:
@@ -244,7 +245,8 @@ def _sections_to_cells(pieces: gpd.GeoDataFrame, grid: gpd.GeoDataFrame,
         "sections_without_geometry": {code: float(totals.loc[code, "total"])
                                       for code in totals.index[~with_geometry]},
     }
-    transfer = RegistryTransfer(groups=groups, report=report, main_section=main_section)
+    transfer = RegistryTransfer(groups=groups, report=report, main_section=main_section,
+                                by_section=by_section)
     if transfer.loss_share > tolerance:
         raise ValueError(
             f"население не сохранилось при переносе: в участках "

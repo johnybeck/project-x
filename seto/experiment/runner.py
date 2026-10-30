@@ -142,22 +142,32 @@ def _save_solutions(evaluation, run_dir: Path) -> None:
             run_dir / "random_A.parquet")
 
 
-def _imagery_dir(cfg: dict, city: str) -> Path:
+def _imagery_dir(cfg: dict, city: str, image_set: str | None = None) -> Path:
     """Где лежат снимки города: raw/<город>/<срез>/imagery/<cell_id>.png.
 
     Снимки — сырые данные того же среза, что OSM и население, поэтому живут
     рядом с ними. Папка своя у каждого города: cell_id нумеруются внутри
-    города, и общая папка смешала бы клетки разных городов."""
+    города, и общая папка смешала бы клетки разных городов. Если у города
+    несколько наборов (D на двух разрешениях), у каждого своя папка внутри;
+    без явного выбора берётся основной набор из конфига."""
     from .. import settings as settings_mod
-    return settings_mod.raw_dir(cfg, city, cfg["snapshot_date"]) / "imagery"
+    folder = settings_mod.raw_dir(cfg, city, cfg["snapshot_date"]) / "imagery"
+    rules = cfg["city"].get("imagery")
+    if not rules:
+        return folder
+    name = image_set or rules["main_set"]
+    if name not in rules["sets"]:
+        raise settings_mod.ConfigError(
+            f"нет набора снимков {name!r}; есть {list(rules['sets'])}")
+    return folder / name
 
 
 def _load_images(folder: Path, cell_ids) -> list[bytes] | None:
     """Снимки клеток, если они загружены (п. 5). Иначе None.
 
-    Загрузчика пока нет (Л6, Ш7): файлы должны появиться в folder по одному
-    PNG на клетку, обрезанные ровно по её квадрату. Нет хотя бы одного —
-    вариант D не считается целиком, частичный D сравнивать нельзя."""
+    Файлы лежат в folder по одному PNG на клетку, обрезанные ровно по её
+    квадрату. Нет хотя бы одного — вариант D не считается целиком, частичный D
+    сравнивать нельзя."""
     if not folder.is_dir():
         return None
     images = []

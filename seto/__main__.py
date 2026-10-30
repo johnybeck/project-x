@@ -530,11 +530,69 @@ def cmd_package_results(args: argparse.Namespace) -> int:
     return 0
 
 
+def _acquire_image_sets(args: argparse.Namespace, cfg: dict) -> int:
+    """Наборы снимков из раздела `imagery` конфига города (пропозал v2, п. 3.8)."""
+    import geopandas as gpd
+    import pandas as pd
+
+    from .experiment.runner import sample_cells
+    from .imagery import acquire as imagery_mod
+
+    rules = cfg["city"]["imagery"]
+    names = [args.set] if args.set else list(rules["sets"])
+    unknown = [name for name in names if name not in rules["sets"]]
+    if unknown:
+        print(f"нет наборов {unknown}; есть {list(rules['sets'])}", file=sys.stderr)
+        return 1
+
+    prepared = Path(args.run_dir)
+    grid = gpd.read_parquet(prepared / "grid.parquet")
+    if args.cells:
+        # те же клетки, что возьмёт score-sample: сначала одна, потом десять
+        chosen = sample_cells(pd.read_parquet(prepared / "cell_features.parquet"),
+                              args.cells, cfg["seed"])
+        grid = grid[grid["cell_id"].isin(chosen)]
+
+    raw = config_mod.raw_dir(cfg, args.city, cfg["snapshot_date"])
+    loaders = {"wms": imagery_mod.acquire_wms, "scene": imagery_mod.acquire_scene}
+    failed = 0
+    with Run.start(args.city, "acquire-imagery", cfg) as run:
+        logger = RunLogger(run.run_id, run.dir / "log.jsonl")
+        for name in names:
+            set_rules = rules["sets"][name]
+            folder = raw / "imagery" / name
+            image_set = loaders[set_rules["type"]](name, grid, set_rules, folder,
+                                                   rules["input_px"], logger.info)
+            logger.info("набор снимков", **image_set.as_dict())
+            print(image_set.as_dict())
+            failed += len(image_set.failed)
+            for cell_id, reason in list(image_set.failed.items())[:10]:
+                print(f"  {cell_id}: {reason}", file=sys.stderr)
+            manifest = imagery_mod.save_manifest(image_set, folder)
+            run.record_output(manifest)
+            # в манифест среза идёт только полный набор: проба на клетках — не данные
+            if not args.cells and not image_set.failed:
+                imagery_mod.record_source(raw / "data_manifest.json", image_set, set_rules,
+                                          manifest, set_rules["url"])
+        logger.close()
+    if failed:
+        print(f"не получено клеток: {failed}. Повторный запуск продолжит с места "
+              "обрыва", file=sys.stderr)
+        return 1
+    print(f"снимки: {raw / 'imagery'}")
+    return 0
+
+
 def cmd_acquire_imagery(args: argparse.Namespace) -> int:
-    """Загрузка снимков по клеткам (п. 5). Требует выбранного провайдера."""
+    """Загрузка снимков по клеткам (п. 5). Требует выбранного источника: наборов
+    в конфиге города или провайдера плиток."""
     from .imagery.tiles import ProviderNotConfigured, plan_all, require_provider
 
     cfg = config_mod.load(args.city)
+    if args.snapshot_date:
+        cfg["snapshot_date"] = args.snapshot_date
+    if cfg["city"].get("imagery"):
+        return _acquire_image_sets(args, cfg)
     try:
         provider = require_provider(cfg)
     except ProviderNotConfigured as error:
@@ -590,6 +648,8 @@ def cmd_score_sample(args: argparse.Namespace) -> int:
     from .scoring import prompt as prompt_mod
 
     cfg = config_mod.load(args.city)
+    if args.snapshot_date:
+        cfg["snapshot_date"] = args.snapshot_date
     runner.guard_test_city(cfg, None)
     features = pd.read_parquet(Path(args.prepared_run) / "cell_features.parquet")
     chosen = features[features["cell_id"].isin(
@@ -599,7 +659,8 @@ def cmd_score_sample(args: argparse.Namespace) -> int:
     if args.mode == "text":
         inputs = prompt_mod.describe_all(chosen).tolist()
     else:
-        inputs = runner._load_images(runner._imagery_dir(cfg, args.city), cell_ids)
+        inputs = runner._load_images(runner._imagery_dir(cfg, args.city, args.image_set),
+                                     cell_ids)
         if inputs is None:
             print(f"нет снимков клеток {cell_ids}", file=sys.stderr)
             return 4
@@ -619,6 +680,37 @@ def cmd_score_sample(args: argparse.Namespace) -> int:
           f"сбоев {report['imputed']}, "
           f"токенов ответа {report['completion_tokens']}")
     print(f"результаты: {run.dir}")
+    return 0
+
+
+def cmd_m4(args: argparse.Namespace) -> int:
+    """М4: ответы модели против года постройки и дохода (пропозал v2, п. 3.10)."""
+    import json
+
+    import pandas as pd
+
+    from .data import income as income_mod
+    from .metrics import perception
+
+    cfg = config_mod.load(args.city)
+    if args.snapshot_date:
+        cfg["snapshot_date"] = args.snapshot_date
+    prepared = Path(args.prepared_run)
+    rules = cfg["city"]["income"]
+    raw = config_mod.raw_dir(cfg, args.city, cfg["snapshot_date"])
+    income = income_mod.read(raw / cfg["city"]["sources"]["tables"][rules["table"]]["file"],
+                             rules)
+    scores_path = Path(args.scores)
+    # файл называется scores_<режим>; эпоху у текста не сверяем: он сам содержит год
+    with_epoch = scores_path.stem != "scores_text"
+    result = perception.evaluate(pd.read_parquet(prepared / "cell_features.parquet"),
+                                 pd.read_parquet(prepared / "cell_sections.parquet"),
+                                 income, pd.read_parquet(scores_path),
+                                 cfg["city"]["m4"]["min_homes"], with_epoch)
+    out = scores_path.with_name(f"m4_{scores_path.stem}.json")
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(f"результаты: {out}")
     return 0
 
 
@@ -770,9 +862,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prepared_run", help="папка прогона prepare-city")
     p.set_defaults(func=cmd_step2)
 
-    p = sub.add_parser("acquire-imagery", help="снимки по клеткам (нужен Л6)")
+    p = sub.add_parser("acquire-imagery", help="снимки по клеткам")
     p.add_argument("city")
-    p.add_argument("run_dir")
+    p.add_argument("run_dir", help="папка прогона prepare-city")
+    p.add_argument("--snapshot-date", default=None)
+    p.add_argument("--set", default=None, help="один набор снимков, по умолчанию все")
+    p.add_argument("--cells", type=int, default=None,
+                   help="только столько клеток — проверка перед всем городом")
     p.set_defaults(func=cmd_acquire_imagery)
 
     p = sub.add_parser("resolution-study",
@@ -798,7 +894,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prepared_run", help="папка прогона prepare-city")
     p.add_argument("--mode", choices=("text", "image"), default="text")
     p.add_argument("--cells", type=int, default=1)
+    p.add_argument("--snapshot-date", default=None)
+    p.add_argument("--image-set", default=None, help="набор снимков, по умолчанию основной")
     p.set_defaults(func=cmd_score_sample)
+
+    p = sub.add_parser("m4", help="сверка ответов модели с эпохой и доходом")
+    p.add_argument("city")
+    p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.add_argument("scores", help="файл scores_image.parquet или scores_text.parquet")
+    p.add_argument("--snapshot-date", default=None)
+    p.set_defaults(func=cmd_m4)
 
     p = sub.add_parser("profile-cities", help="профиль городов-кандидатов")
     p.set_defaults(func=cmd_profile_cities)

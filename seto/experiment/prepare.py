@@ -51,6 +51,9 @@ class CityData:
     groups: pd.DataFrame | None = None
     # район клетки — для разложения неравенства; там же, где группы
     districts: pd.Series | None = None
+    # откуда жители клетки: cell_id, code, total; нужно, чтобы перенести на клетки
+    # доход участков (М4). В признаки не входит: модель эталона не видит
+    cell_sections: pd.DataFrame | None = None
 
     def save(self, out_dir: Path) -> dict[str, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +83,9 @@ class CityData:
                             allowed=self.allowed_pairs)
         self.grid.iloc[self.site_index][["cell_id", "geometry"]].to_parquet(
             paths["sites"])
+        if self.cell_sections is not None:
+            paths["cell_sections"] = out_dir / "cell_sections.parquet"
+            self.cell_sections.to_parquet(paths["cell_sections"])
         return paths
 
 
@@ -239,6 +245,7 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         population = transfer.per_cell.to_numpy()
         groups = getattr(transfer, "groups", None)
         districts = getattr(transfer, "districts", None)
+        cell_sections = getattr(transfer, "by_section", None)
         say("население", total=int(population.sum()),
             loss=transfer.loss_share)
 
@@ -338,7 +345,7 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                     clinic_times=clinic_times,
                     site_times=site_times, site_index=chosen.index,
                     allowed_pairs=allowed, report=report, groups=groups,
-                    districts=districts)
+                    districts=districts, cell_sections=cell_sections)
     data.save(out_dir)
     return data
 
