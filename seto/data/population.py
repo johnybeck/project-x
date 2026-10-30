@@ -157,6 +157,8 @@ class RegistryTransfer:
     prepare-city работает с обоими одинаково."""
     groups: pd.DataFrame         # индекс — cell_id; total и группы из конфига
     report: dict
+    main_section: pd.Series | None = None    # участок, давший клетке больше людей
+    districts: pd.Series | None = None       # его район; заполняет prepare-city
 
     @property
     def per_cell(self) -> pd.Series:
@@ -220,13 +222,21 @@ def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
         pieces[column] = share * pieces["code"].map(populated[column])
 
     pieces["piece_area"] = pieces.geometry.area
-    parts = gpd.overlay(pieces[[*columns, "piece_area", "geometry"]],
+    parts = gpd.overlay(pieces[["code", *columns, "piece_area", "geometry"]],
                         grid[["cell_id", "geometry"]], how="intersection")
     inside = parts.geometry.area / parts["piece_area"]
     for column in columns:
         parts[column] = parts[column] * inside
     groups = parts.groupby("cell_id")[columns].sum().reindex(
         grid["cell_id"], fill_value=0.0)
+
+    # Клетка может лежать в нескольких участках, а разложению неравенства по
+    # районам нужен один. Берём участок, давший клетке больше всего жителей;
+    # при равенстве — меньший код, чтобы ответ не зависел от порядка строк.
+    by_section = parts.groupby(["cell_id", "code"], as_index=False)["total"].sum()
+    main_section = (by_section.sort_values(["total", "code"], ascending=[False, True])
+                    .drop_duplicates("cell_id").set_index("cell_id")["code"]
+                    .reindex(grid["cell_id"]))
 
     raster_inside = float(pieces.loc[pieces["code"].isin(populated.index)
                                      & ~pieces["code"].isin(no_raster), "weight"].sum())
@@ -243,7 +253,7 @@ def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
         "raster_total_in_window": round(float(pixels["pop"].sum()), 1),
         "pixels_used": int(len(pixels)),
     }
-    transfer = RegistryTransfer(groups=groups, report=report)
+    transfer = RegistryTransfer(groups=groups, report=report, main_section=main_section)
     if transfer.loss_share > tolerance:
         raise ValueError(
             f"население не сохранилось при переносе: в участках "

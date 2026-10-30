@@ -130,6 +130,11 @@ def test_cell_groups_strips_prefix():
     assert DM.cell_groups(features).columns.tolist() == ["seniors_65"]
 
 
+def test_district_is_read_from_section_code():
+    codes = pd.Series(["2807903097", None], dtype=object)
+    assert DM.district_codes(codes, RULES).iloc[0] == "03"
+
+
 def test_match_reports_both_sides(tmp_path):
     path = tmp_path / "sections.geojson"
     path.write_text(json.dumps({"features": [

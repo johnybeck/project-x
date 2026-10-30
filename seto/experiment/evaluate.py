@@ -14,6 +14,7 @@ import pandas as pd
 from ..costs.timer import CostLog
 from ..data import demography as demography_mod
 from ..metrics import coverage as cov
+from ..metrics import equity
 from ..metrics import sfca
 from ..scoring import weights as weights_mod
 from ..sites import feasible as sites_mod
@@ -45,9 +46,87 @@ class Evaluation:
     variants: list[VariantResult] = field(default_factory=list)
 
 
+@dataclass
+class Targeting:
+    """Что нужно блоку «адресность»; одно и то же для всех вариантов города."""
+    need: np.ndarray
+    seniors: np.ndarray
+    districts: np.ndarray | None
+    kappa: dict[float, float]     # κ для каждого ε, по исходной сети
+    floor: float                  # A_0 для 2SFCA с весами N
+    slow_speed: float
+
+
+def targeting_inputs(data, cfg: dict) -> Targeting | None:
+    """Подготовить блок «адресность»; None, если у города нет нуждаемости."""
+    need = need_weights(data, cfg)
+    if need is None:
+        return None
+    params = cfg["targeting"]
+    group = cfg["city"]["need"]["seniors_group"]
+    districts = getattr(data, "districts", None)
+    return Targeting(
+        need=need,
+        seniors=data.groups[group].to_numpy(dtype=float),
+        districts=None if districts is None else np.asarray(districts, dtype=object),
+        kappa={epsilon: equity.kolm_pollak_kappa(data.base_times, need, epsilon)
+               for epsilon in (params["ede_epsilon"],
+                               *params["ede_epsilon_sensitivity"])},
+        floor=sfca.floor_value(len(data.clinics), need),
+        slow_speed=params["walk_speed_seniors_m_per_min"])
+
+
+def _targeting_row(times: np.ndarray, base: np.ndarray, target: Targeting, cfg: dict,
+                   facility_times: np.ndarray) -> dict:
+    """Метрики адресности одного варианта (пропозал v2, п. 3.10)."""
+    row: dict = {}
+    main = cfg["T_minutes"]
+    need, seniors = target.need, target.seniors
+    for threshold in sorted({main, *cfg["T_sensitivity"]}):
+        # М1: та же главная метрика, но вместо жителей — нуждающиеся
+        row[f"Cov_N_{threshold}"] = cov.coverage(times, need, threshold)
+        row[f"dCov_N_{threshold}"] = cov.delta_coverage(times, base, need, threshold)
+        row[f"dN_N_{threshold}"] = cov.delta_people(times, base, need, threshold)
+        row[f"dN_65_{threshold}"] = cov.delta_people(times, base, seniors, threshold)
+
+    speed, t_max = cfg["walk_speed_m_per_min"], cfg["t_max_minutes"]
+    slow = cov.at_speed(times, speed, target.slow_speed, t_max)
+    slow_base = cov.at_speed(base, speed, target.slow_speed, t_max)
+    row[f"Cov_65_slow_{main}"] = cov.coverage(slow, seniors, main)
+    row[f"dCov_65_slow_{main}"] = cov.delta_coverage(slow, slow_base, seniors, main)
+    row[f"dN_65_slow_{main}"] = cov.delta_people(slow, slow_base, seniors, main)
+
+    # М3: κ один на все варианты, иначе EDE окажутся в разных шкалах
+    for epsilon, kappa in target.kappa.items():
+        row[f"EDE_{abs(epsilon):g}"] = equity.equally_distributed(times, need, kappa)
+    row["mean_time_N"] = cov.mean_time(times, need)
+    row[f"deficit_N_{main}"] = equity.deficit(times, need, main)
+    row["gini_N"] = equity.gini(times, need)
+    row["theil_N"] = equity.theil(times, need)
+    if target.districts is not None:
+        parts = equity.theil_decomposition(times, need, target.districts)
+        row["theil_between"], row["theil_within"] = parts["between"], parts["within"]
+
+    row.update({f"N_{key}": value for key, value in sfca.summary(
+        facility_times, need, main, target.floor).items()})
+    return row
+
+
+def _site_distance(data, sites, cfg: dict) -> dict:
+    """От новых точек до ближайшего существующего учреждения, м по сети.
+
+    Описательно: сравнение с сетью, а не мера качества. Берётся из матрицы
+    времён, поэтому недостижимая точка покажет потолок t_max."""
+    minutes = data.clinic_times[:, data.site_index[list(sites)]].min(axis=0)
+    metres = minutes * cfg["walk_speed_m_per_min"]
+    return {"site_to_network_mean_m": float(metres.mean()),
+            "site_to_network_min_m": float(metres.min())}
+
+
 def _metrics_row(name: str, times: np.ndarray, base: np.ndarray,
                  population: np.ndarray, cfg: dict,
-                 facility_times: np.ndarray, floor: float) -> dict:
+                 facility_times: np.ndarray, floor: float,
+                 target: Targeting | None = None) -> dict:
     """Все метрики одного варианта. Общий код — в этом весь смысл (п. 11)."""
     row: dict = {"variant": name}
     for threshold in sorted({cfg["T_minutes"], *cfg["T_sensitivity"]}):
@@ -61,6 +140,8 @@ def _metrics_row(name: str, times: np.ndarray, base: np.ndarray,
     row["unreachable_people"] = cov.unreachable_people(times, population,
                                                        cfg["t_max_minutes"])
     row.update(sfca.summary(facility_times, population, cfg["T_minutes"], floor))
+    if target is not None:
+        row.update(_targeting_row(times, base, target, cfg, facility_times))
     return row
 
 
@@ -168,14 +249,17 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
     # --- метрики ---
     floor = sfca.floor_value(len(data.clinics), population)
     clinic_times = _facility_times(data, None)
+    target = targeting_inputs(data, cfg)
     rows = [_metrics_row("исходная сеть", base, base, population, cfg,
-                         clinic_times, floor)]
+                         clinic_times, floor, target)]
     for result in results:
         if not result.sites:
             continue
         times = cov.times_with(base, site_times[list(result.sites)], t_max)
-        rows.append(_metrics_row(result.name, times, base, population, cfg,
-                                 _facility_times(data, result.sites), floor))
+        row = _metrics_row(result.name, times, base, population, cfg,
+                           _facility_times(data, result.sites), floor, target)
+        row.update(_site_distance(data, result.sites, cfg))
+        rows.append(row)
 
     table = pd.DataFrame(rows)
     return Evaluation(table=table,

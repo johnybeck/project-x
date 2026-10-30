@@ -174,6 +174,25 @@ def test_section_without_raster_is_spread_by_area_and_reported(tmp_path):
     assert transfer.report["sections_without_raster"] == {"B": 30}
 
 
+def test_cell_remembers_the_section_that_gave_it_most_people(tmp_path):
+    """Клетка 1 лежит в A и B, но люди в ней в основном из B."""
+    raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))
+    transfer = POP.registry_to_cells(
+        raster, make_grid(), _sections(),
+        _totals(A=(70, 10, 40, 20), B=(300, 0, 200, 100)))
+    assert transfer.main_section.tolist() == ["A", "B"]
+
+
+def test_empty_cell_has_no_main_section(tmp_path):
+    raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))
+    sections = gpd.GeoDataFrame(
+        {"code": ["A"]}, geometry=[box(400_000, 6_199_500, 400_400, 6_200_000)], crs=UTM)
+    transfer = POP.registry_to_cells(raster, make_grid(), sections,
+                                     _totals(A=(70, 0, 70, 0)))
+    assert transfer.main_section.iloc[0] == "A"
+    assert transfer.main_section.isna().iloc[1]
+
+
 def test_section_without_boundary_is_reported_not_spread(tmp_path):
     """Участок есть в регистре, но не на карте: класть его людей некуда."""
     raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))

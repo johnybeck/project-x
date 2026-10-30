@@ -64,6 +64,9 @@ def cfg():
     return {"k": 2, "k_sensitivity": [1], "T_minutes": 15,
             "T_sensitivity": [10, 20], "t_max_minutes": 60, "alpha": 1.0,
             "alpha_sensitivity": [0.5, 2.0], "random_draws": 3, "seed": 0,
+            "walk_speed_m_per_min": 75,
+            "targeting": {"ede_epsilon": -1.0, "ede_epsilon_sensitivity": [-0.5, -2.0],
+                          "walk_speed_seniors_m_per_min": 60},
             "grid": {"size_m": 500}, "city": {"role": "dev", "name": "test"}}
 
 
@@ -105,7 +108,7 @@ def test_scores_change_the_choice(city, cfg):
 NEED_CITY = {"role": "dev", "name": "test",
              "demography": {"groups": {"adults_18_64": [18, 64],
                                        "seniors_65": [65, None]}},
-             "need": {"r": 2.0, "main": "age",
+             "need": {"r": 2.0, "main": "age", "seniors_group": "seniors_65",
                       "definitions": {"age": {"adults_18_64": 1, "seniors_65": "r"}}}}
 
 
@@ -132,11 +135,74 @@ def test_bn_follows_need_not_population(city, cfg):
 
 def test_bn_equal_to_b_is_a_result_not_a_duplicate(city, cfg):
     """BN совпал с B — это ответ «потолок М2 = 0», он не отбрасывается."""
-    _with_groups(city, adults=city.population.copy(), seniors=np.zeros(4))
+    _with_groups(city, adults=city.population * 0.8, seniors=city.population * 0.1)
     by_name = {v.name: v for v in run_variants(
         city, {}, {**cfg, "city": NEED_CITY}).variants}
     assert by_name["BN"].sites == by_name["B"].sites
     assert by_name["BN"].status == "ok" and "совпало с B" in by_name["BN"].note
+
+
+# --- блок «адресность» (задачи блока 5 TODO_V2) ---
+
+def _targeting_table(city, cfg):
+    _with_groups(city, adults=[100.0, 0, 0, 0], seniors=[0, 0, 500.0, 500.0])
+    city.districts = np.array(["01", "01", "02", "02"], dtype=object)
+    return run_variants(city, {}, {**cfg, "city": NEED_CITY}).table.set_index("variant")
+
+
+def test_targeting_metrics_exist_for_every_variant_with_one_code(city, cfg):
+    table = _targeting_table(city, cfg)
+    assert {"исходная сеть", "B", "BN", "M"} <= set(table.index)
+    for column in ("Cov_N_15", "dCov_N_15", "dN_N_15", "dN_65_15", "EDE_1", "EDE_0.5",
+                   "EDE_2", "deficit_N_15", "gini_N", "theil_N", "theil_between",
+                   "theil_within", "N_share_below_floor_pct", "N_p10", "N_p25",
+                   "Cov_65_slow_15", "dCov_65_slow_15"):
+        assert table[column].notna().all(), column
+
+
+def test_targeting_rewards_reaching_the_needy(city, cfg):
+    """BN покрыл нуждающихся, B — нет, хотя по всем жителям B сильнее."""
+    table = _targeting_table(city, cfg)
+    assert table.loc["BN", "dCov_N_15"] > table.loc["B", "dCov_N_15"]
+    assert table.loc["BN", "dN_65_15"] == 1000 and table.loc["B", "dN_65_15"] == 0
+    assert table.loc["BN", "deficit_N_15"] < table.loc["B", "deficit_N_15"]
+    assert table.loc["BN", "EDE_1"] < table.loc["B", "EDE_1"]
+    assert table.loc["B", "dCov_15"] > table.loc["BN", "dCov_15"]
+
+
+def test_ede_of_base_network_is_scaled_by_the_same_kappa(city, cfg):
+    """Все времена по 40 минут: EDE равен 40 при любом ε."""
+    table = _targeting_table(city, cfg)
+    for column in ("EDE_1", "EDE_0.5", "EDE_2"):
+        assert table.loc["исходная сеть", column] == pytest.approx(40)
+
+
+def test_theil_parts_add_up_in_the_table(city, cfg):
+    table = _targeting_table(city, cfg)
+    total = table["theil_between"] + table["theil_within"]
+    assert total.to_numpy() == pytest.approx(table["theil_N"].to_numpy(), abs=1e-12)
+
+
+def test_slow_walk_shrinks_coverage_of_seniors(city, cfg):
+    """13 минут при 75 м/мин — это 16,25 при 60: в 15 минут пожилой не успевает."""
+    city.site_times = city.site_times.copy()
+    city.site_times[2, 2:] = 13.0            # пешком за 13 мин, медленно — 16,25
+    table = _targeting_table(city, cfg)
+    assert table.loc["BN", "dN_65_15"] == 1000
+    assert table.loc["BN", "dN_65_slow_15"] == 0
+
+
+def test_city_without_need_has_no_targeting_columns(city, cfg):
+    """Нет нуждаемости — столбцов нет, а не нули и не копия главной метрики."""
+    table = run_variants(city, {}, cfg).table
+    assert not any(column.startswith(("Cov_N", "EDE", "gini", "theil"))
+                   for column in table.columns)
+
+
+def test_site_distance_is_reported_for_chosen_sites_only(city, cfg):
+    table = run_variants(city, {}, cfg).table.set_index("variant")
+    assert table.loc["B", "site_to_network_mean_m"] == pytest.approx(40 * 75)
+    assert np.isnan(table.loc["исходная сеть", "site_to_network_mean_m"])
 
 
 # --- шаг 2 (задачи 4.5–4.6 TODO_V2) ---

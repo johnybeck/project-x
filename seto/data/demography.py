@@ -119,6 +119,12 @@ def boundary_codes(path: Path, rules: dict) -> set[str]:
                        for key, value in exclude.items())}
 
 
+def district_codes(sections: pd.Series, rules: dict) -> pd.Series:
+    """Район участка: часть кода сразу после кода муниципалитета."""
+    start = len(rules["code_prefix"])
+    return sections.str.slice(start, start + rules["district_digits"])
+
+
 def boundaries(path: Path, rules: dict, crs) -> "gpd.GeoDataFrame":
     """Полигоны участков (колонка code) в проекции сетки, без контуров районов."""
     import geopandas as gpd

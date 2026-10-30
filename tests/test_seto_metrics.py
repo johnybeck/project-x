@@ -92,6 +92,21 @@ def test_mismatched_lengths_raise():
 
 # --- худшие 10 % ---
 
+def test_slower_walk_scales_times_and_keeps_the_cap():
+    """12 минут при 75 м/мин — это 15 при 60; потолок остаётся потолком."""
+    times = np.array([12.0, 13.0, 50.0, 60.0])
+    slow = C.at_speed(times, 75, 60, t_max=60)
+    assert slow.tolist() == pytest.approx([15.0, 16.25, 60.0, 60.0])
+
+
+def test_slow_walk_coverage_shrinks_the_zone():
+    """Зона пожилого меньше: клетка в 13 минутах выпадает из 15-минутной зоны."""
+    times = np.array([12.0, 13.0])
+    seniors = np.array([10.0, 30.0])
+    assert C.coverage(times, seniors, 15) == 100.0
+    assert C.coverage(C.at_speed(times, 75, 60, 60), seniors, 15) == pytest.approx(25.0)
+
+
 def test_worst_decile_takes_the_tail():
     times = np.array([1.0, 1.0, 50.0])
     population = np.array([45.0, 45.0, 10.0])
@@ -171,6 +186,26 @@ def test_floor_is_positive_even_with_zero_median():
     population = np.array([100.0, 100.0])
     assert S.floor_value(3, population) == pytest.approx(0.0075)
     assert S.floor_value(1, population) > 0
+
+
+def test_sfca_invariant_holds_with_need_as_weights():
+    """2SFCA с N — та же формула: тождество среднего верно и для весов N."""
+    rng = np.random.default_rng(1)
+    times = rng.uniform(1, 30, (4, 20))
+    need = rng.uniform(1, 500, 20)
+    access, ratio = S.accessibility(times, need, 15)
+    served = ratio > 0
+    assert (access * need).sum() / need.sum() == pytest.approx(served.sum() / need.sum())
+
+
+def test_summary_with_need_differs_when_need_lives_elsewhere():
+    """Нуждающиеся далеко от учреждения — по N обеспеченность хуже, чем по P."""
+    times = np.array([[5.0, 40.0]])
+    population = np.array([1000.0, 10.0])
+    need = np.array([10.0, 1000.0])
+    by_people = S.summary(times, population, 15, S.floor_value(1, population))
+    by_need = S.summary(times, need, 15, S.floor_value(1, need))
+    assert by_people["share_below_floor_pct"] < by_need["share_below_floor_pct"]
 
 
 def test_summary_has_no_mean():

@@ -48,6 +48,8 @@ class CityData:
     # жители клетки по возрастным группам (колонки из конфига) — есть только
     # там, где население берётся из регистра; иначе None
     groups: pd.DataFrame | None = None
+    # район клетки — для разложения неравенства; там же, где группы
+    districts: pd.Series | None = None
 
     def save(self, out_dir: Path) -> dict[str, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +66,8 @@ class CityData:
             groups = self.groups.drop(columns="total", errors="ignore")
             features = features.assign(**{f"pop_{name}": groups[name].to_numpy()
                                           for name in groups.columns})
+        if self.districts is not None:
+            features = features.assign(district=np.asarray(self.districts, dtype=object))
         features.to_parquet(paths["cell_features"])
         self.clinics.drop(columns="geometry").assign(
             lon=self.clinics.to_crs(4326).geometry.x,
@@ -158,6 +162,7 @@ def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame):
     # люди без участка в регистре — тоже в отчёт, а не в никуда
     transfer.report.update({f"registry_{k}": v for k, v in totals.as_dict().items()
                             if k.startswith("unassigned")})
+    transfer.districts = demography_mod.district_codes(transfer.main_section, rules)
     return transfer
 
 
@@ -203,6 +208,7 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         extra.update(transfer.as_dict())
         population = transfer.per_cell.to_numpy()
         groups = getattr(transfer, "groups", None)
+        districts = getattr(transfer, "districts", None)
         say("население", total=int(population.sum()),
             loss=transfer.loss_share)
 
@@ -297,7 +303,8 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                     clinics=clinics, base_times=base_times,
                     clinic_times=clinic_times,
                     site_times=site_times, site_index=chosen.index,
-                    allowed_pairs=allowed, report=report, groups=groups)
+                    allowed_pairs=allowed, report=report, groups=groups,
+                    districts=districts)
     data.save(out_dir)
     return data
 

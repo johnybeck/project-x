@@ -183,6 +183,26 @@ def test_nearest_time_takes_minimum_over_sources():
     assert M.nearest_time(times, 60)[0] == pytest.approx(0.0)
 
 
+def test_scaling_speed_equals_routing_at_that_speed():
+    """Задача 5.4: пересчёт времён совпадает с расчётом по графу на другой
+    скорости — и по рёбрам, и по подходам, и на потолке t_max."""
+    from seto.metrics.coverage import at_speed
+
+    lines = _lines(LineString([(0, 0), (1500, 0)]), LineString([(1500, 0), (1500, 900)]))
+    origin = np.array([[0.0, 150.0]])
+    targets = np.array([[300.0, 60.0], [1500.0, 90.0], [1560.0, 900.0]])
+    t_max = 40.0                 # 2610 м: 34,8 мин при 75 м/мин, 43,5 при 60
+
+    def routed(speed: float) -> np.ndarray:
+        graph = GR.build(lines, speed, WALK)
+        return M.travel_times(graph, M.snap(graph, origin, 300, speed),
+                              M.snap(graph, targets, 300, speed), t_max)
+
+    fast, slow = routed(SPEED), routed(60.0)
+    assert fast[0, 2] < t_max and slow[0, 2] == t_max      # потолок реально сработал
+    assert at_speed(fast, SPEED, 60.0, t_max) == pytest.approx(slow)
+
+
 def test_network_time_is_never_shorter_than_straight_line():
     """Главная проверка замены прямой на сеть: по улицам всегда не ближе."""
     g = GR.build(_lines(LineString([(0, 0), (0, 400)]),

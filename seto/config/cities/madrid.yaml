@@ -149,6 +149,7 @@ need:
   # допущения: 1,84–1,96.
   r: 1.93
   main: age
+  seniors_group: seniors_65        # группа «пожилые» в метриках адресности
   definitions:
     age: {adults_18_64: 1, seniors_65: "r"}          # основное
     age_r1: {adults_18_64: 1, seniors_65: 1}         # устойчивость: r = 1

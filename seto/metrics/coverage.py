@@ -59,6 +59,18 @@ def times_with(existing: np.ndarray, added: np.ndarray | None,
     return np.minimum(base, np.asarray(added, dtype=float).min(axis=0))
 
 
+def at_speed(times: np.ndarray, speed: float, new_speed: float,
+             t_max: float) -> np.ndarray:
+    """Те же маршруты при другой скорости ходьбы, с тем же потолком t_max.
+
+    Новая матрица не нужна: и время по рёбрам графа, и время подхода к узлу —
+    это длина, делённая на скорость, поэтому все времена меняются в одно и то
+    же число раз (проверено прямым расчётом по графу Мадрида)."""
+    if speed <= 0 or new_speed <= 0:
+        raise ValueError("скорость должна быть больше нуля")
+    return np.minimum(np.asarray(times, dtype=float) * speed / new_speed, t_max)
+
+
 def worst_decile_time(times: np.ndarray, population: np.ndarray,
                       share: float = 0.10) -> float:
     """Среднее время для доли населения с наибольшим временем (п. 11.2).

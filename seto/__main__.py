@@ -447,7 +447,8 @@ def _load_city_data(run_dir: Path):
         base_times=times["base"], clinic_times=times["clinics"],
         site_times=times["sites"], site_index=times["site_index"],
         allowed_pairs=times["allowed"], report={},
-        groups=groups if len(groups.columns) else None)
+        groups=groups if len(groups.columns) else None,
+        districts=features["district"] if "district" in features else None)
 
 
 def cmd_step2(args: argparse.Namespace) -> int:
