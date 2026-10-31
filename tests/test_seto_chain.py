@@ -289,7 +289,8 @@ def clean_tree(monkeypatch):
 
 def _freeze(path, city="madrid"):
     cfg = settings.load(city)
-    return proto.freeze(cfg, {city: "dev"}, {}, path, {city: proto.city_rules(cfg)},
+    return proto.freeze(cfg, {city: "dev"}, {city: "h"}, path,
+                        {city: proto.city_rules(cfg)},
                         {city: [{"name": "osm_pbf", "url": "u", "license": "ODbL",
                                  "downloaded_at": "2026-10-28", "sha256": "x"}]})
 
@@ -318,9 +319,9 @@ def test_protocol_page_lists_deviations_and_licenses(clean_tree, tmp_path):
 def test_verify_detects_changed_need_of_a_city(clean_tree, tmp_path):
     json_path, _ = _freeze(tmp_path)
     cfg = settings.load("madrid")
-    assert proto.verify(json_path, cfg)["ok"]
+    assert proto.verify(json_path, cfg, {"madrid": "h"})["ok"]
     cfg["city"]["need"]["r"] = 3.0
-    result = proto.verify(json_path, cfg)
+    result = proto.verify(json_path, cfg, {"madrid": "h"})
     assert any("правила города madrid" in problem for problem in result["problems"])
 
 

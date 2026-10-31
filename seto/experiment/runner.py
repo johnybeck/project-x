@@ -86,6 +86,8 @@ def run_city(city: str, cfg: dict, protocol_path: Path | None = None,
     with Run.start(city, "run-city", cfg) as run:
         logger = RunLogger(run.run_id, run.dir / "log.jsonl")
         logger.info("старт", city=city, role=cfg["city"].get("role"))
+        if protocol_path is not None:
+            run.record_input(protocol_path)
 
         data = prepare_city(city, cfg, run.dir, logger, costs)
         for path in data.save(run.dir).values():

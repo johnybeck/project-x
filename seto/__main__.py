@@ -267,6 +267,8 @@ def cmd_run_city(args: argparse.Namespace) -> int:
     if args.snapshot_date:
         cfg["snapshot_date"] = args.snapshot_date
     protocol = _Path(args.protocol) if args.protocol else None
+    if protocol is not None and _refused(protocol, args.city, cfg):
+        return 3
     try:
         out = run_city(args.city, cfg, protocol, args.with_image, args.mode)
     except ProtocolRequired as error:
@@ -296,10 +298,11 @@ def cmd_freeze_protocol(args: argparse.Namespace) -> int:
     cfg = config_mod.load()
     configs = {name: config_mod.load(name) for name in config_mod.available_cities()}
     cities = {name: item["city"].get("role", "?") for name, item in configs.items()}
-    # протокол привязывается к данным городов проверки: без хешей run-test
-    # не заметил бы перекачку данных после заморозки
+    # протокол привязывается к данным всех городов, у которых они есть: без хешей
+    # сверка не заметила бы перекачку после заморозки. У городов проверки они обязательны
     test_cities = [name for name, role in cities.items() if role == "test"]
-    hashes = city_data_hashes(_data_manifests(test_cities))
+    manifests = _data_manifests(list(configs))
+    hashes = city_data_hashes(manifests)
     missing = sorted(set(test_cities) - set(hashes))
     if missing:
         print("нельзя замораживать: нет data_manifest.json у городов проверки "
@@ -310,7 +313,7 @@ def cmd_freeze_protocol(args: argparse.Namespace) -> int:
         json_path, md_path = freeze(
             cfg, cities, hashes, Path(args.out),
             {name: city_rules(item) for name, item in configs.items()},
-            data_sources(_data_manifests(list(configs))))
+            data_sources(manifests))
     except ProtocolMismatch as error:
         print(f"нельзя замораживать: {error}", file=sys.stderr)
         return 1
@@ -322,7 +325,6 @@ def cmd_freeze_protocol(args: argparse.Namespace) -> int:
 
 def cmd_run_test(args: argparse.Namespace) -> int:
     """Прогон городов проверки: только при совпадении с протоколом (п. 13)."""
-    from .experiment.protocol import city_data_hashes, verify
     from .experiment.runner import run_city
 
     protocol = Path(args.protocol)
@@ -330,15 +332,18 @@ def cmd_run_test(args: argparse.Namespace) -> int:
         print(f"нет протокола: {protocol}", file=sys.stderr)
         return 3
 
+    configs = {name: config_mod.load(name) for name in config_mod.available_cities()}
+    tested = {name: cfg for name, cfg in configs.items()
+              if cfg["city"].get("role") == "test"}
+    if not tested:
+        # молчаливый выход выглядел бы как успешный прогон
+        print("городов с ролью test нет, считать нечего: для остальных городов — "
+              "run-city и step2 с --protocol", file=sys.stderr)
+        return 1
+
     failures = 0
-    for name in config_mod.available_cities():
-        cfg = config_mod.load(name)
-        if cfg["city"].get("role") != "test":
-            continue
-        check = verify(protocol, cfg, city_data_hashes(_data_manifests([name])))
-        if not check["ok"]:
-            print(f"{name}: запуск запрещён — " + "; ".join(check["problems"]),
-                  file=sys.stderr)
+    for name, cfg in tested.items():
+        if _refused(protocol, name, cfg):
             failures += 1
             continue
         out = run_city(name, cfg, protocol, args.with_image, "onboard_city")
@@ -416,6 +421,25 @@ def _data_manifests(cities: list[str]) -> dict[str, Path]:
     return paths
 
 
+def _refused(protocol: Path, name: str, cfg: dict, runs: tuple[Path, ...] = ()) -> bool:
+    """Сверить город и готовые папки с протоколом; True — считать нельзя.
+
+    Роль города тут ни при чём: Мадрид с ролью dev сверяется так же, как город
+    проверки. Причины отказа — в stderr."""
+    from .experiment.protocol import city_data_hashes, verify, verify_run
+
+    if not protocol.is_file():
+        print(f"нет протокола: {protocol}", file=sys.stderr)
+        return True
+    hashes = city_data_hashes(_data_manifests([name]))
+    problems = verify(protocol, cfg, hashes)["problems"]
+    for run_dir in runs:
+        problems += verify_run(protocol, run_dir, name)
+    if problems:
+        print(f"{name}: запуск запрещён — " + "; ".join(problems), file=sys.stderr)
+    return bool(problems)
+
+
 def _manifest_hash(run_dir: Path) -> str:
     from .run import sha256_of
 
@@ -466,17 +490,26 @@ def cmd_step2(args: argparse.Namespace) -> int:
     import pandas as pd
 
     from .costs.timer import CostLog
-    from .experiment.runner import guard_test_city
+    from .experiment.runner import ProtocolRequired, guard_test_city
     from .experiment.step2 import run_step2
 
     cfg = config_mod.load(args.city)
-    guard_test_city(cfg, None)
+    protocol = Path(args.protocol) if args.protocol else None
     prepared = Path(args.prepared_run)
+    scored = Path(args.scores) if args.scores else None
+    try:
+        guard_test_city(cfg, protocol)
+    except ProtocolRequired as error:
+        print(f"запуск запрещён: {error}", file=sys.stderr)
+        return 3
+    if protocol is not None and _refused(protocol, args.city, cfg,
+                                         tuple(p for p in (prepared, scored) if p)):
+        return 3
     data = _load_city_data(prepared)
     scores = None
-    if args.scores:
+    if scored:
         try:
-            scores = _load_scores(Path(args.scores), data.features["cell_id"].tolist())
+            scores = _load_scores(scored, data.features["cell_id"].tolist())
         except ValueError as error:
             print(f"скоры не подходят: {error}", file=sys.stderr)
             return 1
@@ -485,6 +518,8 @@ def cmd_step2(args: argparse.Namespace) -> int:
         logger = RunLogger(run.run_id, run.dir / "log.jsonl")
         for name in ("manifest.json", "times.npz", "cell_features.parquet"):
             run.record_input(prepared / name)
+        if protocol is not None:
+            run.record_input(protocol)
         paths = run_step2(data, cfg, run.dir, logger, costs, scores)
         for path in paths.values():
             run.record_output(path)
@@ -854,7 +889,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("city")
     p.add_argument("--snapshot-date", default=None)
     p.add_argument("--protocol", default=None,
-                   help="путь к protocol.json (обязателен для городов test)")
+                   help="protocol.json: сверка перед прогоном, у городов test обязателен")
     p.add_argument("--with-image", action="store_true",
                    help="считать вариант D (нужны загруженные снимки)")
     p.add_argument("--mode", default="onboard_city",
@@ -914,6 +949,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prepared_run", help="папка прогона prepare-city")
     p.add_argument("--scores", default=None,
                    help="папка прогона со скорами модели: посчитать C, D и их захват")
+    p.add_argument("--protocol", default=None,
+                   help="protocol.json: сверка кода, правил, данных и готовых папок")
     p.set_defaults(func=cmd_step2)
 
     p = sub.add_parser("ahp-stability", help="устойчивость E: Монте-Карло")

@@ -22,7 +22,7 @@ python -m seto prepare-city madrid                         # подготовк�
 python -m seto step2 madrid <папка prepare-city>           # всё, что считается без модели, 43 минуты
 python -m seto ahp-stability madrid <папка prepare-city>   # устойчивость E, 3 секунды
 python -m seto acquire-imagery madrid <папка prepare-city> # снимки, около 2 часов
-pytest tests/                                              # 527 тестов, около 2 минут
+pytest tests/                                              # 556 тестов, около 2 минут
 ```
 
 Дальше нужен сервер модели. Порядок обязателен: одна клетка, потом 10, потом город.
@@ -32,12 +32,25 @@ python -m seto score-sample madrid <папка prepare-city> --mode text --cells
 python -m seto score-sample madrid <папка prepare-city> --mode image --cells 1
 python -m seto run-city madrid --with-image
 python -m seto report <папка run-city>
-python -m seto step2 madrid <папка prepare-city> --scores <папка run-city>
 python -m seto m4 madrid <папка prepare-city> <папка run-city>/scores_image.parquet
 ```
 
 `run-city` заново делает подготовку города в новой папке прогона, скоринг берёт из
 кэша, если он уже считался.
+
+Результат считается после заморозки и только с `--protocol`:
+
+```bash
+python -m seto freeze-protocol
+python -m seto run-city madrid --with-image --protocol protocol/protocol.json
+python -m seto step2 madrid <папка run-city> --scores <папка run-city> --protocol protocol/protocol.json
+```
+
+`--protocol` сверяет коммит, чистоту дерева, модель, промпт, параметры, правила города и
+данные, у `step2` ещё и манифесты папок, из которых он читает. При расхождении команда
+отказывает с причиной и кодом 3. Протокол записывается во входы манифеста прогона. Папка
+`protocol/` стоит в `.gitignore`: файлы протокола в git-дереве сделали бы его грязным, а
+их коммит сменил бы коммит протокола.
 
 `snapshot_date` города в `madrid.yaml` и дата папки в `raw/` обязаны совпадать.
 `acquire` конфиг не читает: без `--snapshot-date` он кладёт данные в папку с
@@ -91,18 +104,18 @@ split-tunnel; это обход на случай, когда его нет.
 | `doctor` | проверка окружения |
 | `acquire` | сырые данные в `raw/<город>/<дата>/`, с хешами |
 | `prepare-city` | сетка, население, признаки, граф, матрица времён, площадки |
-| `step2` | A, B, BN, M, E, EN, EP и М2 при k = 1, 2, 5, 10, без модели; `--scores` — плюс C, D, D10, CN, DN и их захват |
+| `step2` | A, B, BN, M, E, EN, EP и М2 при k = 1, 2, 5, 10, без модели; `--scores` — плюс C, D, D10, CN, DN и их захват; `--protocol` — сверка с протоколом |
 | `ahp-stability` | устойчивость E, Монте-Карло |
 | `acquire-imagery` | снимки по клеткам; `--set` — один набор, `--cells` — проба |
 | `score-sample` | подоценки модели на нескольких клетках |
-| `run-city` | всё по порядку до отчёта при k = 2; `--with-image` — варианты D и D10 |
+| `run-city` | всё по порядку до отчёта при k = 2; `--with-image` — варианты D и D10; `--protocol` — сверка с протоколом |
 | `m4` | сверка ответов модели с эпохой и доходом |
 | `report` | напечатать `report.md` прогона |
 | `sensitivity` | устойчивость к T, k, α по папке `run-city` |
 | `prompt-dev` | диагностика промпта и инспектор клеток (только города `dev`) |
 | `resolution-study` | влияние разрешения снимка на суждение модели |
-| `freeze-protocol` | заморозка протокола и текст для Wiki |
-| `run-test` | прогон городов с ролью `test`, только при совпадении с протоколом |
+| `freeze-protocol` | заморозка протокола с хешами данных городов и текст для Wiki |
+| `run-test` | прогон городов с ролью `test`, только при совпадении с протоколом; у Мадрида роль `dev`, ему нужны `run-city` и `step2` с `--protocol` |
 | `export-for-ahp` / `import-solution` | обмен с внешней командой AHP; в v2 E считается у нас, команды остались |
 | `log-human` | активное время человека; `manual_fix` и `restart` считает критерий надёжности |
 | `package-results` | пакет, из которого всё пересчитывается |
@@ -168,7 +181,7 @@ seto/
 | | что нужно | что это держит |
 |---|---|---|
 | **Л2** | доступ к серверу модели | C, D, D10, CN, DN, захват, М4, семь разниц цепочки |
-| **Л14** | заморозить протокол и опубликовать на Wiki | основной прогон; мешают также Д22 и Д23 |
+| **Л14** | заморозить протокол и опубликовать на Wiki | основной прогон; мешает также Д22 |
 | **Л15** | вести журнал времени с подключения Мадрида | критерии затрат и надёжности |
 | руководитель | вопросы Д17–Д21 и отступления | заморозку |
 

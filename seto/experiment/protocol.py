@@ -59,8 +59,8 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
            sources: dict[str, list[dict]] | None = None) -> tuple[Path, Path]:
     """Собрать protocol.json и текст для страницы предрегистрации.
 
-    cities — роль каждого города, data_hashes — хеши манифестов данных
-    городов проверки, rules и sources — правила городов и их источники данных."""
+    cities — роль каждого города, data_hashes — хеши манифестов данных городов,
+    rules и sources — правила городов и их источники данных."""
     state = git_state()
     if state.get("dirty"):
         raise ProtocolMismatch(
@@ -85,7 +85,6 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
             "alpha", "alpha_sensitivity", "score_rule", "score_rules",
             "random_draws", "seed", "swap_heuristic", "m2", "targeting", "ahp",
             "pilot", "imputation_max_share", "feasible_site", "grid") if key in cfg},
-        "snapshot_date": cfg.get("snapshot_date"),
         "cities": cities,
         "city_rules": rules or {},
         "data_sources": sources or {},
@@ -123,7 +122,9 @@ def verify(protocol_path: Path, cfg: dict,
            data_hashes: dict[str, str] | None = None) -> dict:
     """Проверить, что состояние совпадает с протоколом (п. 13).
 
-    Возвращает список расхождений; пустой означает, что запускать можно."""
+    Если в cfg есть город, сверяется он один: чужие данные тут ни при чём, а город
+    без записи в протоколе считать нельзя. Возвращает список расхождений; пустой
+    означает, что запускать можно."""
     protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
     problems: list[str] = []
 
@@ -147,10 +148,17 @@ def verify(protocol_path: Path, cfg: dict,
 
     name = (cfg.get("city") or {}).get("name")
     frozen = (protocol.get("city_rules") or {}).get(name)
-    if frozen is not None and frozen != city_rules(cfg):
+    if name is not None and frozen is None:
+        problems.append(f"города {name} нет в протоколе")
+    elif frozen is not None and frozen != city_rules(cfg):
         problems.append(f"правила города {name} изменились")
 
-    for city, expected in (protocol.get("data_hashes") or {}).items():
+    frozen_data = protocol.get("data_hashes") or {}
+    if name is not None and name not in frozen_data:
+        problems.append(f"в протоколе нет данных города {name}")
+    for city, expected in frozen_data.items():
+        if name is not None and city != name:
+            continue
         if data_hashes is None:
             # вызывающий не проверял данные — молча считать их совпавшими нельзя
             problems.append(f"данные города {city} не проверены")
@@ -163,6 +171,34 @@ def verify(protocol_path: Path, cfg: dict,
 
     return {"ok": not problems, "problems": problems,
             "protocol_sha256": protocol.get("sha256")}
+
+
+def verify_run(protocol_path: Path, run_dir: Path, city: str) -> list[str]:
+    """Чем готовая папка прогона расходится с протоколом; пусто — ей можно верить.
+
+    Шаг, который читает готовую папку, сам ничего не пересчитывает: свежие код и
+    данные не спасут, если папка сделана до заморозки или на другом срезе."""
+    run_dir = Path(run_dir)
+    path = run_dir / "manifest.json"
+    if not path.is_file():
+        return [f"в папке {run_dir.name} нет манифеста"]
+    protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    git = manifest.get("git") or {}
+    snapshot = ((protocol.get("city_rules") or {}).get(city) or {}).get("snapshot_date")
+
+    problems = []
+    if manifest.get("city") != city:
+        problems.append(f"папка {run_dir.name}: город {manifest.get('city')} вместо {city}")
+    if git.get("commit") != protocol.get("commit"):
+        problems.append(f"папка {run_dir.name}: коммит {git.get('commit')} вместо "
+                        f"{protocol.get('commit')}")
+    if git.get("dirty"):
+        problems.append(f"папка {run_dir.name}: сделана на грязном дереве")
+    if manifest.get("snapshot_date") != snapshot:
+        problems.append(f"папка {run_dir.name}: срез {manifest.get('snapshot_date')} "
+                        f"вместо {snapshot}")
+    return problems
 
 
 def hash_city_data(manifest_path: Path) -> str:
@@ -186,14 +222,14 @@ def _markdown(protocol: dict) -> str:
         f"Заморожен: {protocol['frozen_at']}",
         f"Коммит: `{protocol['commit']}`",
         f"Модель: `{protocol['model']}`",
-        f"Срез данных: {protocol['snapshot_date']}",
         f"Хеш протокола: `{protocol['sha256']}`",
         "",
         "## Города",
         "",
     ]
     for city, role in protocol["cities"].items():
-        lines.append(f"- **{city}** — {role}")
+        snapshot = (protocol["city_rules"].get(city) or {}).get("snapshot_date")
+        lines.append(f"- **{city}** — {role}, срез данных {snapshot}")
     lines += ["", "## Параметры", "", "```json",
               json.dumps(protocol["parameters"], ensure_ascii=False, indent=2),
               "```", "", "## Правила городов", "", "```json",
