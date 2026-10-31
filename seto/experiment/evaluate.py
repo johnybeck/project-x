@@ -21,6 +21,9 @@ from ..sites import feasible as sites_mod
 from ..variants import ahp
 from ..variants import solve as solver
 
+# какой скор какому варианту: image — основной набор снимков, image_10m — снимки 10 м
+SCORED_VARIANTS = {"text": "C", "image": "D", "image_10m": "D10"}
+
 
 @dataclass
 class VariantResult:
@@ -259,8 +262,8 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
                                  tie_count=solution.tie_count))
     say("вариант M", sites=list(solution.sites), ties=solution.tie_count)
 
-    # --- C и D: те же веса плюс скор ---
-    for name, key in (("C", "text"), ("D", "image")):
+    # --- C, D и D на 10 м: те же веса плюс скор ---
+    for key, name in SCORED_VARIANTS.items():
         if key not in scores:
             results.append(VariantResult(name, (), status="missing_external",
                                          note=f"нет скоров режима {key}"))
@@ -280,6 +283,22 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
                   f"{comparison['correlation']:.4f}" if same_as_b else
                   f"корреляция весов с B {comparison['correlation']:.4f}")))
         say(f"вариант {name}", sites=list(solution.sites), same_as_b=same_as_b)
+
+    # --- CN и DN: BN плюс скор. Описательно: совпадение с BN — результат, а не дубликат ---
+    for name, key in (("CN", "text"), ("DN", "image")):
+        if need is None or key not in scores:
+            results.append(VariantResult(name, (), status="missing_external",
+                                         note="нет нуждаемости или скоров режима " + key))
+            continue
+        with costs.stage("solve", f"variant:{name}"):
+            weights = weights_mod.demand(need, scores[key], cfg["alpha"])
+            solution = solver.solve_pmedian_any(site_times, base, weights, allowed,
+                                                k, name, cfg)
+        same_as_bn = solution.sites == next(r.sites for r in results if r.name == "BN")
+        results.append(VariantResult(name, solution.sites, objective=solution.objective,
+                                     tie_count=solution.tie_count,
+                                     note="решение совпало с BN" if same_as_bn else ""))
+        say(f"вариант {name}", sites=list(solution.sites), same_as_bn=same_as_bn)
 
     results.extend(_ahp_variants(data, cfg, k, costs, say))
 
@@ -311,7 +330,8 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
 
     table = pd.DataFrame(rows)
     return Evaluation(table=table,
-                      differences=_differences(table, results, cfg),
+                      differences=_differences(table, results, cfg,
+                                               float(population.sum())),
                       variants=results)
 
 
@@ -325,48 +345,66 @@ def _facility_times(data, sites) -> np.ndarray:
     return np.vstack([existing, data.site_times[list(sites)]])
 
 
-# BN стоит перед B: пропозал v2 (п. 3.4) читает разницу как BN − B
-_PAIR_ORDER = ("D", "C", "BN", "B", "E", "M")
+# Цепочка разниц (пропозал v2, п. 3.4): соседние варианты отличаются одной частью
+# системы, поэтому разница выделяет её вклад. Слева проверяемый вариант: иначе знак
+# главных разниц был бы обратным. D10 — D на снимках 10 м.
+CHAIN = (("B", "A", "оптимизатор и данные о населении"),
+         ("M", "B", "сколько покрытия теряет цель «среднее время» против цели «покрытие»"),
+         ("C", "B", "оценщик VLM без изображения"),
+         ("D", "C", "именно изображение: та же модель и тот же промпт"),
+         ("D", "D10", "разрешение снимка"),
+         ("BN", "B", "ценность знания о нуждаемости, потолок М2"),
+         ("CN", "BN", "насколько скор сдвигает решение BN, описательно"),
+         ("DN", "BN", "насколько скор сдвигает решение BN, описательно"),
+         ("D", "E", "MVP против практики AHP"),
+         ("D", "EP", "снимок против экспертных критериев при одном решателе"))
 
 
-def _differences(table: pd.DataFrame, results: list[VariantResult],
-                 cfg: dict) -> pd.DataFrame:
-    """Разницы между вариантами в п.п. и жителях (п. 11.4)."""
+def _differences(table: pd.DataFrame, results: list[VariantResult], cfg: dict,
+                 people: float) -> pd.DataFrame:
+    """Цепочка разниц в п.п. и жителях; у A берётся медиана случайных наборов.
+
+    Если варианта нет, строка остаётся с пометкой «нет данных»: так видно, какая
+    разница не посчитана, а не только какие посчитаны."""
     threshold = cfg["T_minutes"]
+    coverage, gained = f"dCov_{threshold}", f"dN_{threshold}"
+    coverage_pp, gained_people = f"dCov_{threshold}_pp", f"dN_{threshold}_people"
     indexed = table.set_index("variant")
     available = [r.name for r in results if r.sites and r.name in indexed.index]
-
-    # Порядок пар — как в METRICS.md: проверяемый вариант слева (D − C, D − B,
-    # C − B). Алфавитный порядок дал бы «C − D», то есть главную разницу
-    # эксперимента с обратным знаком.
-    order = [name for name in _PAIR_ORDER if name in available]
-    rows = []
-    for position, left in enumerate(order):
-        for right in order[position + 1:]:
-            rows.append({
-                "pair": f"{left} − {right}",
-                f"dCov_{threshold}_pp": (indexed.loc[left, f"dCov_{threshold}"]
-                                         - indexed.loc[right, f"dCov_{threshold}"]),
-                f"dN_{threshold}_people": (indexed.loc[left, f"dN_{threshold}"]
-                                           - indexed.loc[right, f"dN_{threshold}"]),
-            })
-
     random_result = next((r for r in results if r.name == "A"), None)
-    if random_result is not None and random_result.distribution is not None:
-        p95 = float(np.percentile(random_result.distribution, 95))
+    spread = None if random_result is None else random_result.distribution
+
+    def effect(name: str) -> tuple[float, float] | None:
+        if name == "A":
+            if spread is None:
+                return None
+            median = float(np.median(spread))
+            return median, median * people / 100
+        if name not in available:
+            return None
+        return float(indexed.loc[name, coverage]), float(indexed.loc[name, gained])
+
+    rows = []
+    for left, right, meaning in CHAIN:
+        row = {"pair": f"{left} − {right}", "meaning": meaning}
+        ours, other = effect(left), effect(right)
+        if ours is None or other is None:
+            absent = left if ours is None else right
+            rows.append({**row, coverage_pp: np.nan, gained_people: np.nan,
+                         "note": f"нет данных: вариант {absent} не считался"})
+        else:
+            rows.append({**row, coverage_pp: ours[0] - other[0],
+                         gained_people: ours[1] - other[1]})
+
+    if spread is not None:
+        p95 = float(np.percentile(spread, 95))
         for name in available:
-            value = indexed.loc[name, f"dCov_{threshold}"]
+            value = indexed.loc[name, coverage]
             rows.append({
                 "pair": f"{name} − A (медиана)",
-                f"dCov_{threshold}_pp": value - float(np.median(random_result.distribution)),
-                f"dN_{threshold}_people": np.nan,
+                coverage_pp: value - float(np.median(spread)),
+                gained_people: np.nan,
                 "above_A_p95": bool(value > p95),
-                "percentile_in_A": float(100 * (random_result.distribution < value).mean()),
+                "percentile_in_A": float(100 * (spread < value).mean()),
             })
-    # строка-напоминание: без D главная разница эксперимента не посчитана,
-    # даже если C и B есть
-    if "D" not in available:
-        rows.append({"pair": "D − …", f"dCov_{threshold}_pp": np.nan,
-                     f"dN_{threshold}_people": np.nan,
-                     "note": "вариант D не считался: нет снимков"})
     return pd.DataFrame(rows)

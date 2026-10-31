@@ -69,11 +69,13 @@ def noise_draws(data, cfg: dict, k: int, draws: int, amplitude: float,
 
 
 def study(data, needs: dict[str, np.ndarray], cfg: dict, k_values: list[int],
-          logger=None) -> tuple[pd.DataFrame, dict]:
+          logger=None, variants: dict[int, dict] | None = None) -> tuple[pd.DataFrame, dict]:
     """М2 при каждом k и каждом определении нуждаемости.
 
     Возвращает таблицу (строка — определение × k) и решения B′ по k, чтобы
     порог шума можно было пересчитать из сохранённых файлов без решателя.
+    variants — решения проверяемых вариантов {k: {имя: площадки}}: по ним считается
+    их доля захвата.
 
     Если k площадок разнести нельзя, задача решается с наибольшим допустимым
     k (п. 3.2, ограничение 5); в таблице видны оба числа."""
@@ -96,6 +98,11 @@ def study(data, needs: dict[str, np.ndarray], cfg: dict, k_values: list[int],
             ceiling = z_b - z_bn
             noise, _ = draws.threshold(data.site_times, data.base_times, need,
                                        z_b, t_max, params["noise_percentile"])
+            captures = {
+                f"capture_{variant}": capture(
+                    z_b, need_time(data.site_times, data.base_times, sites, need, t_max),
+                    ceiling, noise)
+                for variant, sites in (variants or {}).get(requested, {}).items()}
             rows.append({
                 "need": name, "k": requested, "k_used": k,
                 "B_sites": list(b.sites), "BN_sites": list(bn.sites),
@@ -112,6 +119,7 @@ def study(data, needs: dict[str, np.ndarray], cfg: dict, k_values: list[int],
                 "negative_ceiling": bool(ceiling < -1e-6 * max(1.0, abs(z_b))),
                 "capture_B": capture(z_b, z_b, ceiling, noise),
                 "capture_BN": capture(z_b, z_bn, ceiling, noise),
+                **captures,
             })
             say("М2", need=name, k=requested, ceiling=round(ceiling, 1),
                 noise=round(noise, 1), above=ceiling > noise)

@@ -21,7 +21,8 @@ ARTIFACTS = ("metrics.parquet", "metrics_main.csv", "metrics_thresholds.csv",
              "differences.csv", "solutions.json", "random_A.parquet",
              "report.json", "report.md", "costs.json", "manifest.json",
              "city_report.json", "effective_config.yaml", "log.jsonl",
-             "scores_text.parquet", "scores_image.parquet", "solution_E.json")
+             "scores_text.parquet", "scores_image.parquet",
+             "scores_image_10m.parquet", "solution_E.json")
 
 # сырые входы: только ссылки и хеши, сами файлы в архив лаборатории
 BY_REFERENCE = ("osm.pbf", ".tif", "imagery")

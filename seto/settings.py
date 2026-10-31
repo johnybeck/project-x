@@ -51,13 +51,17 @@ def available_cities() -> list[str]:
 
 
 def load(city: str | None = None) -> dict:
-    """Эффективный конфиг: глобальный плюс городской под ключом `city`."""
+    """Эффективный конфиг: глобальный плюс городской под ключом `city`.
+
+    Срез данных город может задать свой: источники у городов обновляются по-разному,
+    и общий срез указывал бы на папку, которой нет."""
     cfg: dict[str, Any] = load_global()
     validate_global(cfg)
     if city is not None:
         city_cfg = load_city(city)
         validate_city(city_cfg, city)
         cfg["city"] = city_cfg
+        cfg["snapshot_date"] = city_cfg.get("snapshot_date", cfg.get("snapshot_date"))
     return cfg
 
 

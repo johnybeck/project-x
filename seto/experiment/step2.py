@@ -19,7 +19,7 @@ import pandas as pd
 from ..costs.timer import CostLog
 from ..data import demography as demography_mod
 from ..metrics import substitution as m2_mod
-from .evaluate import run_variants
+from .evaluate import SCORED_VARIANTS, run_variants
 
 
 def needs_for(data, cfg: dict) -> dict[str, np.ndarray]:
@@ -41,33 +41,39 @@ def coverage_by_k(metrics: pd.DataFrame, random_a: pd.DataFrame,
     spread = random_a.groupby("k")["dCov"]
     result = pd.DataFrame({"A_median": spread.median(),
                            "A_p95": spread.quantile(0.95)})
-    for name in ("B", "BN", "M", "E", "EN", "EP"):
+    for name in ("B", "BN", "M", "C", "D", "D10", "CN", "DN", "E", "EN", "EP"):
         if name in table.columns:
             result[name] = table[name]
     return result.reset_index()
 
 
 def run_step2(data, cfg: dict, out_dir: Path, logger=None,
-              costs: CostLog | None = None) -> dict[str, Path]:
-    """Посчитать шаг 2 и сохранить всё, из чего выводы пересчитываются."""
+              costs: CostLog | None = None,
+              scores: dict[str, np.ndarray] | None = None) -> dict[str, Path]:
+    """Посчитать шаг 2 и сохранить всё, из чего выводы пересчитываются.
+
+    scores — скоры модели, если они уже есть: тогда при каждом k считаются C и D и
+    их доли захвата. Без них шаг 2 по-прежнему не требует ни снимков, ни модели."""
     costs = costs or CostLog()
     out_dir.mkdir(parents=True, exist_ok=True)
     k_values = cfg["m2"]["k_values"]
 
-    metrics, differences, solutions, random_a = [], [], {}, []
+    metrics, differences, solutions, random_a, captured = [], [], {}, [], {}
     for k in k_values:
-        evaluation = run_variants(data, {}, {**cfg, "k": k}, costs, logger)
+        evaluation = run_variants(data, scores or {}, {**cfg, "k": k}, costs, logger)
         metrics.append(evaluation.table.assign(k=k))
         differences.append(evaluation.differences.assign(k=k))
         solutions[str(k)] = [variant.as_dict() for variant in evaluation.variants]
         spread = next(v for v in evaluation.variants if v.name == "A").distribution
         random_a.append(pd.DataFrame({"k": k, "dCov": spread}))
+        captured[k] = {v.name: v.sites for v in evaluation.variants
+                       if v.name in SCORED_VARIANTS.values() and v.sites}
     metrics, differences = pd.concat(metrics), pd.concat(differences)
     random_a = pd.concat(random_a, ignore_index=True)
 
     needs = needs_for(data, cfg)
     with costs.stage("m2", "shared_prep"):
-        table, noise_sites = m2_mod.study(data, needs, cfg, k_values, logger)
+        table, noise_sites = m2_mod.study(data, needs, cfg, k_values, logger, captured)
 
     paths = {"solutions": out_dir / "solutions.json",
              "metrics": out_dir / "metrics.csv",

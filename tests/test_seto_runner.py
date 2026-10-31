@@ -299,7 +299,7 @@ def test_random_variant_has_a_distribution(city, cfg):
 def test_differences_include_comparison_with_random(city, cfg):
     result = run_variants(city, {}, cfg)
     pairs = result.differences["pair"].tolist()
-    assert any("B − M" in p for p in pairs)
+    assert any("M − B" in p for p in pairs)
     assert any("− A (медиана)" in p for p in pairs)
 
 

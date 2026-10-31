@@ -290,15 +290,16 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_freeze_protocol(args: argparse.Namespace) -> int:
     """Заморозить протокол и собрать страницу предрегистрации (п. 13)."""
-    from .experiment.protocol import ProtocolMismatch, city_data_hashes, freeze
+    from .experiment.protocol import (ProtocolMismatch, city_data_hashes, city_rules,
+                                      data_sources, freeze)
 
     cfg = config_mod.load()
-    cities = {name: config_mod.load_city(name).get("role", "?")
-              for name in config_mod.available_cities()}
+    configs = {name: config_mod.load(name) for name in config_mod.available_cities()}
+    cities = {name: item["city"].get("role", "?") for name, item in configs.items()}
     # протокол привязывается к данным городов проверки: без хешей run-test
     # не заметил бы перекачку данных после заморозки
     test_cities = [name for name, role in cities.items() if role == "test"]
-    hashes = city_data_hashes(_data_manifests(cfg, test_cities))
+    hashes = city_data_hashes(_data_manifests(test_cities))
     missing = sorted(set(test_cities) - set(hashes))
     if missing:
         print("нельзя замораживать: нет data_manifest.json у городов проверки "
@@ -306,7 +307,10 @@ def cmd_freeze_protocol(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     try:
-        json_path, md_path = freeze(cfg, cities, hashes, Path(args.out))
+        json_path, md_path = freeze(
+            cfg, cities, hashes, Path(args.out),
+            {name: city_rules(item) for name, item in configs.items()},
+            data_sources(_data_manifests(list(configs))))
     except ProtocolMismatch as error:
         print(f"нельзя замораживать: {error}", file=sys.stderr)
         return 1
@@ -331,8 +335,7 @@ def cmd_run_test(args: argparse.Namespace) -> int:
         cfg = config_mod.load(name)
         if cfg["city"].get("role") != "test":
             continue
-        check = verify(protocol, cfg,
-                       city_data_hashes(_data_manifests(cfg, [name])))
+        check = verify(protocol, cfg, city_data_hashes(_data_manifests([name])))
         if not check["ok"]:
             print(f"{name}: запуск запрещён — " + "; ".join(check["problems"]),
                   file=sys.stderr)
@@ -403,10 +406,14 @@ def cmd_log_human(args: argparse.Namespace) -> int:
     return 0
 
 
-def _data_manifests(cfg: dict, cities: list[str]) -> dict[str, Path]:
-    """Пути к data_manifest.json городов в срезе snapshot_date."""
-    return {name: config_mod.raw_dir(cfg, name, cfg["snapshot_date"])
-            / "data_manifest.json" for name in cities}
+def _data_manifests(cities: list[str]) -> dict[str, Path]:
+    """Пути к data_manifest.json городов, у каждого в его срезе."""
+    paths = {}
+    for name in cities:
+        cfg = config_mod.load(name)
+        paths[name] = (config_mod.raw_dir(cfg, name, cfg["snapshot_date"])
+                       / "data_manifest.json")
+    return paths
 
 
 def _manifest_hash(run_dir: Path) -> str:
@@ -466,12 +473,19 @@ def cmd_step2(args: argparse.Namespace) -> int:
     guard_test_city(cfg, None)
     prepared = Path(args.prepared_run)
     data = _load_city_data(prepared)
+    scores = None
+    if args.scores:
+        try:
+            scores = _load_scores(Path(args.scores), data.features["cell_id"].tolist())
+        except ValueError as error:
+            print(f"скоры не подходят: {error}", file=sys.stderr)
+            return 1
     costs = CostLog()
     with Run.start(args.city, "step2", cfg) as run:
         logger = RunLogger(run.run_id, run.dir / "log.jsonl")
         for name in ("manifest.json", "times.npz", "cell_features.parquet"):
             run.record_input(prepared / name)
-        paths = run_step2(data, cfg, run.dir, logger, costs)
+        paths = run_step2(data, cfg, run.dir, logger, costs, scores)
         for path in paths.values():
             run.record_output(path)
         run.record_output(costs.save(run.dir / "costs.json"))
@@ -480,10 +494,12 @@ def cmd_step2(args: argparse.Namespace) -> int:
     number = {"float_format": lambda v: f"{v:.2f}"}
     print()
     print(pd.read_csv(paths["coverage_by_k"]).to_string(index=False, **number))
+    table = pd.read_csv(paths["m2"])
     columns = ["need", "k", "same_sites", "ceiling_per_1000", "noise_per_1000",
-               "above_noise"]
+               "above_noise", *[name for name in ("capture_C", "capture_D", "capture_D10")
+                                if name in table.columns]]
     print()
-    print(pd.read_csv(paths["m2"])[columns].to_string(index=False, **number))
+    print(table[columns].to_string(index=False, **number))
     print(f"\nрезультаты: {run.dir}")
     return 0
 
@@ -762,14 +778,21 @@ def cmd_profile_cities(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_scores(run_dir: Path) -> dict:
+def _load_scores(run_dir: Path, cell_ids: list[str] | None = None) -> dict:
+    """Скоры прогона. Если заданы cell_ids, порядок клеток обязан совпасть: скор идёт
+    в вес спроса по позиции, и чужой порядок молча раздал бы его не тем клеткам."""
     import pandas as pd
 
+    from .experiment.evaluate import SCORED_VARIANTS
+
     scores = {}
-    for mode in ("text", "image"):
-        path = run_dir / f"scores_{mode}.parquet"
+    for key in SCORED_VARIANTS:
+        path = run_dir / f"scores_{key}.parquet"
         if path.is_file():
-            scores[mode] = pd.read_parquet(path)["score"].to_numpy()
+            frame = pd.read_parquet(path)
+            if cell_ids is not None and frame["cell_id"].tolist() != cell_ids:
+                raise ValueError(f"в {path.name} другие клетки или другой порядок")
+            scores[key] = frame["score"].to_numpy()
     return scores
 
 
@@ -869,7 +892,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", default="onboard_city",
                    choices=("dev_build", "onboard_city", "recompute"))
     p.add_argument("--minutes", type=float, required=True)
-    p.add_argument("--activity", required=True)
+    p.add_argument("--activity", required=True,
+                   help="что делали; manual_fix и restart считает критерий надёжности")
     p.add_argument("--note", default=None)
     p.set_defaults(func=cmd_log_human)
 
@@ -888,6 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("step2", help="шаг 2: все варианты без снимков и М2")
     p.add_argument("city")
     p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.add_argument("--scores", default=None,
+                   help="папка прогона со скорами модели: посчитать C, D и их захват")
     p.set_defaults(func=cmd_step2)
 
     p = sub.add_parser("ahp-stability", help="устойчивость E: Монте-Карло")

@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..costs import human
+
 MAIN_COLUMNS = ("variant", "Cov_15", "dCov_15", "dN_15", "worst_decile_min",
                 "mean_time_min", "share_below_floor_pct", "p10", "p25")
 
@@ -36,8 +38,41 @@ def appendix_table(evaluation, cfg: dict) -> pd.DataFrame:
     return evaluation.table[present].copy()
 
 
-def pilot_criteria(evaluation, cfg: dict, costs: dict | None = None) -> dict:
-    """Критерии пилота (п. 18.3).
+def _cost_criterion(cfg: dict, costs: dict | None, human_log: Path | None) -> dict:
+    """Затраты: человек у D не больше половины от E; машинное время только для справки.
+    Что мерится у E, пропозал велит назвать заранее — поэтому оно идёт в отчёт."""
+    city = (cfg.get("city") or {}).get("name")
+    verdict = ({"status": "нет данных: журнал человеко-времени (log-human) не передан"}
+               if human_log is None else human.cost_criterion(human_log, city))
+    return {**verdict, "E_measured_as": (cfg.get("pilot") or {}).get("e_cost_measure"),
+            "machine_time": costs or "журнал затрат не передан"}
+
+
+def _reliability_criterion(evaluation, cfg: dict, human_log: Path | None) -> dict:
+    """Надёжность: D дал решение без ручной правки, при сбое — один перезапуск.
+
+    Определена через D, как и качество: пока D не считался, ставить «выполнен» по
+    другим вариантам — та же подмена. Правки и перезапуски код не видит, их
+    записывает человек, поэтому без журнала — «нет данных»."""
+    statuses = {v.name: v.status for v in evaluation.variants}
+    city = (cfg.get("city") or {}).get("name")
+    events = None if human_log is None else human.reliability_events(human_log, city)
+    if statuses.get("D") == "failed":
+        status = "не выполнен"
+    elif statuses.get("D") not in ("ok", "skipped_duplicate"):
+        status = "нет данных: вариант D не считался"
+    elif events is None:
+        status = "нет данных: в журнале (log-human) нет записей о D"
+    elif events["manual_fixes"] == 0 and events["restarts"] <= 1:
+        status = "выполнен"
+    else:
+        status = "не выполнен"
+    return {"statuses": statuses, "events": events, "status": status}
+
+
+def pilot_criteria(evaluation, cfg: dict, costs: dict | None = None,
+                   human_log: Path | None = None) -> dict:
+    """Критерии пилота (п. 18.3, пропозал v2, п. 3.10).
 
     Качество: ΔCov_T варианта D выше 95-го процентиля случайного выбора A.
     Если D не считался, критерий помечается «нет данных», а не подменяется
@@ -60,39 +95,16 @@ def pilot_criteria(evaluation, cfg: dict, costs: dict | None = None) -> dict:
                                  if quality.get("D_dCov", -np.inf) > p95
                                  else "не выполнен")
         else:
-            quality["status"] = ("нет данных: вариант D не считался "
-                                 "(нет снимков, Л6)")
+            quality["status"] = "нет данных: вариант D не считался"
 
-    # Надёжность определена через D, как и качество: «D дал допустимое решение
-    # без ручной правки». Пока D не считался, ставить «выполнен» по другим
-    # вариантам — та же подмена, что и в критерии качества.
-    statuses = {v.name: v.status for v in evaluation.variants}
-    if statuses.get("D") in ("ok", "skipped_duplicate"):
-        reliability_status = "выполнен"
-    elif statuses.get("D") == "failed":
-        reliability_status = "не выполнен"
-    else:
-        reliability_status = "нет данных: вариант D не считался (нет снимков, Л6)"
-
-    return {
-        "quality": quality,
-        # В отчёт идёт только машинное время. Сам критерий (человеко-время D
-        # не больше половины E) требует журнала log-human и решения E —
-        # автоматически он не считается.
-        "costs": {"status": ("не оценён автоматически: нужен журнал "
-                             "человеко-времени (log-human) и решение E"),
-                  "machine_time": costs or "журнал затрат не передан"},
-        "reliability": {
-            "statuses": statuses,
-            # ручные правки код не видит: их фиксирует человек в журнале
-            "manual_fixes": "не измеряется кодом",
-            "status": reliability_status,
-        },
-    }
+    return {"quality": quality,
+            "costs": _cost_criterion(cfg, costs, human_log),
+            "reliability": _reliability_criterion(evaluation, cfg, human_log)}
 
 
 def build(evaluation, city_report: dict, cfg: dict, out_dir: Path,
-          costs: dict | None = None, scoring: dict | None = None) -> dict:
+          costs: dict | None = None, scoring: dict | None = None,
+          human_log: Path | None = None) -> dict:
     """Собрать отчёт: таблицы в CSV, сводка в JSON и читаемый Markdown."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {}
@@ -110,7 +122,7 @@ def build(evaluation, city_report: dict, cfg: dict, out_dir: Path,
     summary = {
         "city": city_report,
         "variants": [v.as_dict() for v in evaluation.variants],
-        "pilot_criteria": pilot_criteria(evaluation, cfg, costs),
+        "pilot_criteria": pilot_criteria(evaluation, cfg, costs, human_log),
         "scoring": scoring or {},
         "costs": costs or {},
     }

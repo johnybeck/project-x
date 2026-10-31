@@ -144,6 +144,12 @@ ahp:
     weight_methods: ["published", "eigenvector", "submatrix"]
     tie_rules: ["population_T", "population_cell", "cell_order"]
 
+# Критерии пилота (пропозал v2, п. 3.10). Что мерится у E, пропозал велит указать
+# заранее: algorithm — наша реконструкция, manual_analyst — ручная работа аналитика в
+# ГИС. Берём algorithm: ручного процесса в проекте нет, и мерить было бы нечего.
+pilot:
+  e_cost_measure: "algorithm"
+
 # --- Допустимые площадки ---
 # [Д7] — правило пока черновое, требует подтверждения.
 # Клетка отсекается, если ЛЮБОЕ условие ниже не выполнено (sites/feasible.py).

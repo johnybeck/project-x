@@ -17,10 +17,36 @@ from pathlib import Path
 
 from ..run import git_state, sha256_of
 from ..scoring import prompt as prompt_mod
+from .evaluate import CHAIN
+
+# что фиксируется по городу, кроме среза; остальное считается одинаково везде
+_CITY_KEYS = ("need", "population", "imagery", "income", "m4", "deviations")
 
 
 class ProtocolMismatch(RuntimeError):
     """Текущее состояние расходится с замороженным протоколом."""
+
+
+def city_rules(cfg: dict) -> dict:
+    """Правила города: срез, определения нуждаемости, снимки, отступления от пропозала."""
+    city = cfg["city"]
+    return {"snapshot_date": cfg["snapshot_date"],
+            **{key: city[key] for key in _CITY_KEYS if key in city}}
+
+
+def data_sources(manifests: dict[str, Path]) -> dict[str, list[dict]]:
+    """Срезы и лицензии: что, откуда и когда взято у каждого города.
+
+    Берётся из манифестов загрузки. Города без манифеста пропускаются, как и в
+    city_data_hashes."""
+    result = {}
+    for city, path in manifests.items():
+        if Path(path).is_file():
+            sources = json.loads(Path(path).read_text(encoding="utf-8"))["sources"]
+            result[city] = [{key: source.get(key) for key in
+                             ("name", "url", "license", "downloaded_at", "sha256")}
+                            for source in sources]
+    return result
 
 
 def _hash_payload(payload: dict) -> str:
@@ -29,11 +55,12 @@ def _hash_payload(payload: dict) -> str:
 
 
 def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
-           out_dir: Path) -> tuple[Path, Path]:
+           out_dir: Path, rules: dict[str, dict] | None = None,
+           sources: dict[str, list[dict]] | None = None) -> tuple[Path, Path]:
     """Собрать protocol.json и текст для страницы предрегистрации.
 
     cities — роль каждого города, data_hashes — хеши манифестов данных
-    городов проверки."""
+    городов проверки, rules и sources — правила городов и их источники данных."""
     state = git_state()
     if state.get("dirty"):
         raise ProtocolMismatch(
@@ -56,17 +83,27 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
             "walk_speed_m_per_min", "t_max_minutes", "snap_max_m",
             "min_dist_to_existing_m", "min_dist_between_new_m",
             "alpha", "alpha_sensitivity", "score_rule", "score_rules",
-            "random_draws", "seed",
-            "imputation_max_share", "feasible_site", "grid") if key in cfg},
+            "random_draws", "seed", "swap_heuristic", "m2", "targeting", "ahp",
+            "pilot", "imputation_max_share", "feasible_site", "grid") if key in cfg},
         "snapshot_date": cfg.get("snapshot_date"),
         "cities": cities,
+        "city_rules": rules or {},
+        "data_sources": sources or {},
         "data_hashes": data_hashes,
+        "chain": [f"{left} − {right}: {meaning}" for left, right, meaning in CHAIN],
         "metrics": ["Cov_T", "dCov_T", "dN_T", "worst_decile", "mean_time",
-                    "2SFCA: share_below_floor, p10, p25"],
+                    "2SFCA: share_below_floor, p10, p25",
+                    "М1: Cov_N_T, dCov_N_T, dN_N_T, новые 65+, 65+ при медленной ходьбе",
+                    "М2: потолок, порог шума, доля захвата C, D, D10 при всех k",
+                    "М3: EDE, дефицит, Джини, Тейль с разложением, 2SFCA по N",
+                    "М4: каппа эпохи у D, ранговая корреляция достатка с доходом"],
         "pilot_criteria": {
             "quality": "dCov_T варианта D выше 95-го процентиля варианта A",
-            "costs": "активное время человека у D не более половины от E",
-            "reliability": "D дал допустимое решение без ручной правки",
+            "costs": ("активное время человека на подключение нового города у D не "
+                      "более половины, чем у E; у E мерится: "
+                      f"{(cfg.get('pilot') or {}).get('e_cost_measure')}"),
+            "reliability": ("D дал допустимое решение без ручной правки; "
+                            "при сбое допускается один перезапуск"),
         },
         "not_computed": ["порог допустимой потери δ", "порог ε",
                          "среднее A_i по 2SFCA"],
@@ -107,6 +144,11 @@ def verify(protocol_path: Path, cfg: dict,
     for key, value in protocol.get("parameters", {}).items():
         if cfg.get(key) != value:
             problems.append(f"параметр {key}: {cfg.get(key)} вместо {value}")
+
+    name = (cfg.get("city") or {}).get("name")
+    frozen = (protocol.get("city_rules") or {}).get(name)
+    if frozen is not None and frozen != city_rules(cfg):
+        problems.append(f"правила города {name} изменились")
 
     for city, expected in (protocol.get("data_hashes") or {}).items():
         if data_hashes is None:
@@ -154,11 +196,22 @@ def _markdown(protocol: dict) -> str:
         lines.append(f"- **{city}** — {role}")
     lines += ["", "## Параметры", "", "```json",
               json.dumps(protocol["parameters"], ensure_ascii=False, indent=2),
-              "```", "", "## Метрики", ""]
+              "```", "", "## Правила городов", "", "```json",
+              json.dumps(protocol["city_rules"], ensure_ascii=False, indent=2),
+              "```", "", "## Цепочка разниц", ""]
+    lines += [f"- {item}" for item in protocol["chain"]]
+    lines += ["", "## Метрики", ""]
     lines += [f"- {m}" for m in protocol["metrics"]]
     lines += ["", "## Критерии пилота", ""]
     for name, text in protocol["pilot_criteria"].items():
         lines.append(f"- **{name}**: {text}")
+    lines += ["", "## Отступления от пропозала", ""]
+    for city, rules in protocol["city_rules"].items():
+        lines += [f"- **{city}**: {item}" for item in rules.get("deviations", [])]
+    lines += ["", "## Данные и лицензии", ""]
+    for city, sources in protocol["data_sources"].items():
+        lines += [f"- **{city}**, {item['name']}: {item['license']}, "
+                  f"загружено {item['downloaded_at']}" for item in sources]
     lines += ["", "## Чего эксперимент НЕ делает", ""]
     lines += [f"- {m}" for m in protocol["not_computed"]]
     lines += ["", "После просмотра результатов проверки ничего из этого "

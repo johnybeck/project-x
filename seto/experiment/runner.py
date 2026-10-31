@@ -20,7 +20,7 @@ from ..report import city as report_mod
 from ..run import Run
 from ..scoring import client as scoring_client
 from ..scoring import prompt as prompt_mod
-from .evaluate import run_variants
+from .evaluate import SCORED_VARIANTS, run_variants
 from .prepare import prepare_city
 
 
@@ -51,22 +51,24 @@ def sample_cells(features: pd.DataFrame, count: int, seed: int) -> list[str]:
     return order[:count].tolist()
 
 
-def _score_variant(mode: str, cell_ids, inputs, cfg: dict, run_dir: Path,
+def _score_variant(key: str, cell_ids, inputs, cfg: dict, run_dir: Path,
                    costs: CostLog, logger) -> tuple[np.ndarray | None, dict]:
     """Скоры одного варианта. Сбой не роняет город — вариант станет failed."""
-    variant = "C" if mode == "text" else "D"
+    variant = SCORED_VARIANTS[key]
+    mode = "text" if key == "text" else "image"
     # кэш должен лежать рядом с raw/ и runs/, а не в текущем каталоге:
-    # иначе запуск из другой папки заново тратит тысячи вызовов модели
+    # иначе запуск из другой папки заново тратит тысячи вызовов модели.
+    # Наборы снимков делят один кэш: в его ключе байты снимка, они не смешаются
     from .. import settings as settings_mod
     cache = (settings_mod.data_root(cfg)
              / cfg["paths"].get("vlm_cache", "cache/vlm") / mode)
     try:
         with costs.stage("scoring", f"variant:{variant}") as extra:
             scores, report = scoring_client.score_cells(
-                cell_ids, inputs, mode, cfg, cache, run_dir / f"vlm_raw_{mode}")
+                cell_ids, inputs, mode, cfg, cache, run_dir / f"vlm_raw_{key}")
             scoring_client.check_imputed(report, cfg)
             extra.update(report.as_dict())
-        scores.to_parquet(run_dir / f"scores_{mode}.parquet")
+        scores.to_parquet(run_dir / f"scores_{key}.parquet")
         logger.info(f"скоринг {variant}", **report.as_dict())
         return scores["score"].to_numpy(), report.as_dict()
     except Exception as error:
@@ -92,27 +94,27 @@ def run_city(city: str, cfg: dict, protocol_path: Path | None = None,
         scores: dict[str, np.ndarray] = {}
         scoring_reports: dict[str, dict] = {}
 
+        cell_ids = data.features["cell_id"].tolist()
         texts = prompt_mod.describe_all(data.features).tolist()
-        values, report = _score_variant("text", data.features["cell_id"].tolist(),
-                                        texts, cfg, run.dir, costs, logger)
+        values, report = _score_variant("text", cell_ids, texts, cfg, run.dir, costs,
+                                        logger)
         scoring_reports["text"] = report
         if values is not None:
             scores["text"] = values
 
         if with_image:
-            images = _load_images(_imagery_dir(cfg, city),
-                                  data.features["cell_id"].tolist())
-            if images is None:
-                scoring_reports["image"] = {
-                    "status": "missing", "reason": "снимки не загружены (п. 5, Л6)"}
-                logger.warn("вариант D пропущен: нет снимков")
-            else:
-                values, report = _score_variant(
-                    "image", data.features["cell_id"].tolist(), images, cfg,
-                    run.dir, costs, logger)
-                scoring_reports["image"] = report
+            for key, image_set in _image_sets(cfg).items():
+                images = _load_images(_imagery_dir(cfg, city, image_set), cell_ids)
+                if images is None:
+                    scoring_reports[key] = {
+                        "status": "missing", "reason": "снимки не загружены (п. 5, Л6)"}
+                    logger.warn(f"вариант {SCORED_VARIANTS[key]} пропущен: нет снимков")
+                    continue
+                values, report = _score_variant(key, cell_ids, images, cfg, run.dir,
+                                                costs, logger)
+                scoring_reports[key] = report
                 if values is not None:
-                    scores["image"] = values
+                    scores[key] = values
         else:
             scoring_reports["image"] = {
                 "status": "skipped", "reason": "запуск без --with-image"}
@@ -122,9 +124,11 @@ def run_city(city: str, cfg: dict, protocol_path: Path | None = None,
 
         costs_path = costs.save(run.dir / "costs.json")
         run.record_output(costs_path)
+        from .. import settings as settings_mod
         paths = report_mod.build(evaluation, data.report, cfg, run.dir,
                                  costs=json.loads(costs_path.read_text("utf-8")),
-                                 scoring=scoring_reports)
+                                 scoring=scoring_reports,
+                                 human_log=settings_mod.data_root(cfg) / "human_log.csv")
         for path in paths.values():
             run.record_output(path)
         logger.info("готово", seconds=round(costs.total(), 1))
@@ -140,6 +144,18 @@ def _save_solutions(evaluation, run_dir: Path) -> None:
     if random_result is not None and random_result.distribution is not None:
         pd.DataFrame({"dCov": random_result.distribution}).to_parquet(
             run_dir / "random_A.parquet")
+
+
+def _image_sets(cfg: dict) -> dict[str, str | None]:
+    """Какие снимки в какой скор: основной набор — D, `low_set` — D на 10 м.
+    Без раздела imagery снимки лежат одной папкой, и D считается один раз."""
+    rules = cfg["city"].get("imagery")
+    if not rules:
+        return {"image": None}
+    sets = {"image": rules["main_set"]}
+    if rules.get("low_set"):
+        sets["image_10m"] = rules["low_set"]
+    return sets
 
 
 def _imagery_dir(cfg: dict, city: str, image_set: str | None = None) -> Path:

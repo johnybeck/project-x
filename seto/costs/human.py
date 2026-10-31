@@ -19,6 +19,9 @@ import pandas as pd
 
 COLUMNS = ("timestamp", "city", "variant", "mode", "minutes", "activity", "note")
 MODES = ("dev_build", "onboard_city", "recompute")
+# записи с такими activity считает критерий надёжности: кода они не видят
+MANUAL_FIX = "manual_fix"
+RESTART = "restart"
 
 
 @dataclass
@@ -84,6 +87,22 @@ def cost_criterion(path: Path, city: str, reference: str = "E",
     return {"status": "выполнен" if times[candidate] <= limit else "не выполнен",
             "candidate_minutes": times[candidate],
             "reference_minutes": times[reference], "limit_minutes": limit}
+
+
+def reliability_events(path: Path, city: str, variant: str = "D") -> dict | None:
+    """Сколько ручных правок и перезапусков записано у варианта в городе.
+
+    None, если записей о варианте нет: нельзя сказать «правок не было», когда
+    журнал просто не вели."""
+    if not Path(path).is_file():
+        return None
+    frame = pd.read_csv(path)
+    activity = frame.loc[(frame["city"] == city) & (frame["variant"] == variant),
+                         "activity"]
+    if activity.empty:
+        return None
+    return {"manual_fixes": int((activity == MANUAL_FIX).sum()),
+            "restarts": int((activity == RESTART).sum())}
 
 
 def price_of_gain(costs_minutes: float, reference_minutes: float,
