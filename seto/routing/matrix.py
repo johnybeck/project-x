@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import shapely
 from scipy.sparse.csgraph import dijkstra
 
 from .graph import WalkGraph
@@ -84,6 +85,35 @@ def travel_times(graph: WalkGraph, sources: Snapped, targets: Snapped,
         np.minimum(block, t_max_minutes, out=block)
         block[~np.isfinite(block)] = t_max_minutes
         result[np.ix_(batch, live_targets)] = block
+    return result
+
+
+def road_nodes(graph: WalkGraph, lines, classes: list[str],
+               max_distance_m: float) -> np.ndarray:
+    """Узлы графа у дорог из списка классов.
+
+    Автомагистрали в пешеходный граф не входят, поэтому вершины линий привязываются
+    к ближайшему узлу, а не ищутся среди узлов."""
+    main = lines[lines["highway"].isin(classes)]
+    nodes, _ = graph.snap(shapely.get_coordinates(main.geometry.to_numpy()),
+                          max_distance_m)
+    return np.unique(nodes[nodes >= 0])
+
+
+def nearest_source(graph: WalkGraph, sources: np.ndarray, targets: Snapped,
+                   t_max_minutes: float) -> np.ndarray:
+    """Время от каждой цели до ближайшего из узлов sources, минуты.
+
+    Нужен только ближайший источник, поэтому хватает одного запуска Дейкстры, сколько
+    бы источников ни было. Как и в travel_times, дальше t_max — это t_max."""
+    result = np.full(len(targets.node), t_max_minutes, dtype=float)
+    live = np.flatnonzero(targets.attached)
+    if len(sources) == 0 or live.size == 0:
+        return result
+    distances = dijkstra(graph.matrix, directed=False, indices=sources,
+                         limit=float(t_max_minutes), min_only=True)
+    result[live] = np.minimum(distances[targets.node[live]] + targets.approach_min[live],
+                              t_max_minutes)
     return result
 
 

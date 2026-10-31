@@ -18,6 +18,7 @@ from ..metrics import equity
 from ..metrics import sfca
 from ..scoring import weights as weights_mod
 from ..sites import feasible as sites_mod
+from ..variants import ahp
 from ..variants import solve as solver
 
 
@@ -161,6 +162,51 @@ def need_weights(data, cfg: dict) -> np.ndarray | None:
     return need.to_numpy(dtype=float)
 
 
+def _ahp_ranked(name: str, grades: dict, weights: dict, ties: np.ndarray, data, k: int,
+                costs: CostLog) -> VariantResult:
+    """E или EN: площадки с наибольшей пригодностью при общих ограничениях."""
+    with costs.stage("solve", f"variant:{name}"):
+        score = ahp.combine(grades, weights)[data.site_index]
+        sites = tuple(sorted(ahp.choose(score, ties, data.allowed_pairs, k)))
+    sites_mod.validate(sites, data.allowed_pairs, expected_k=k)
+    top = ahp.top_cells(score)
+    return VariantResult(name, sites, objective=float(score[list(sites)].sum()),
+                         tie_count=top - 1, note=f"верхний балл у {top} клеток")
+
+
+def _ahp_variants(data, cfg: dict, k: int, costs: CostLog, say) -> list[VariantResult]:
+    """E, EN, EP (пропозал v2, п. 3.6). Чего нет в данных, то «нет данных», а не подмена:
+    без критерия нуждаемости EN совпал бы с E и разница между ними ничего бы не значила."""
+    criteria = ahp.layers(data, cfg)
+    if criteria is None:
+        note = "нет критериев AHP: подготовка города без времён до дорог и плотных районов"
+        return [VariantResult(name, (), status="missing_external", note=note)
+                for name in ("E", "EN", "EP")]
+
+    rules = cfg["ahp"]
+    grades = ahp.graded(criteria, data.site_index, rules["classes"])
+    ties = ahp.population_within(data.site_times, data.population, cfg["T_minutes"])
+    results = [_ahp_ranked("E", grades, ahp.kept_weights(rules), ties, data, k, costs)]
+    if "need" not in criteria:
+        note = "нет нуждаемости: у города нет возрастных групп или раздела need"
+        return results + [VariantResult(name, (), status="missing_external", note=note)
+                          for name in ("EN", "EP")]
+
+    weights = ahp.need_weights(rules)
+    results.append(_ahp_ranked("EN", grades, weights, ties, data, k, costs))
+    # EP: тот же решатель и тот же канал, что у C и D — множитель веса спроса
+    with costs.stage("solve", "variant:EP"):
+        demand = weights_mod.demand(data.population, ahp.combine(grades, weights),
+                                    cfg["alpha"])
+        solution = solver.solve_pmedian_any(data.site_times, data.base_times, demand,
+                                            data.allowed_pairs, k, "EP", cfg)
+    results.append(VariantResult("EP", solution.sites, objective=solution.objective,
+                                 tie_count=solution.tie_count))
+    for result in results:
+        say(f"вариант {result.name}", sites=list(result.sites))
+    return results
+
+
 def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
                  costs: CostLog | None = None, logger=None) -> Evaluation:
     """Решить A, B, M, C, D и посчитать метрики. scores — скоры по вариантам."""
@@ -234,6 +280,8 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
                   f"{comparison['correlation']:.4f}" if same_as_b else
                   f"корреляция весов с B {comparison['correlation']:.4f}")))
         say(f"вариант {name}", sites=list(solution.sites), same_as_b=same_as_b)
+
+    results.extend(_ahp_variants(data, cfg, k, costs, say))
 
     # --- A: случайный выбор ---
     with costs.stage("solve", "variant:A"):

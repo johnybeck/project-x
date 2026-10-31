@@ -448,11 +448,14 @@ def _load_city_data(run_dir: Path):
         site_times=times["sites"], site_index=times["site_index"],
         allowed_pairs=times["allowed"], report={},
         groups=groups if len(groups.columns) else None,
-        districts=features["district"] if "district" in features else None)
+        districts=features["district"] if "district" in features else None,
+        # прогоны старше слоёв AHP: у них варианты E, EN, EP будут «нет данных»
+        road_times=times["to_roads"] if "to_roads" in times.files else None,
+        dense_times=times["to_dense"] if "to_dense" in times.files else None)
 
 
 def cmd_step2(args: argparse.Namespace) -> int:
-    """Шаг 2 пропозала v2: A, B, M, BN и М2 при k из m2.k_values — без снимков."""
+    """Шаг 2 пропозала v2: A, B, M, BN, E, EN, EP и М2 при k из m2.k_values — без снимков."""
     import pandas as pd
 
     from .costs.timer import CostLog
@@ -481,6 +484,31 @@ def cmd_step2(args: argparse.Namespace) -> int:
                "above_noise"]
     print()
     print(pd.read_csv(paths["m2"])[columns].to_string(index=False, **number))
+    print(f"\nрезультаты: {run.dir}")
+    return 0
+
+
+def cmd_ahp_stability(args: argparse.Namespace) -> int:
+    """Устойчивость E: Монте-Карло по спорным выборам (пропозал v2, п. 3.6)."""
+    from .experiment.ahp_stability import study
+    from .experiment.runner import guard_test_city
+
+    cfg = config_mod.load(args.city)
+    guard_test_city(cfg, None)
+    prepared = Path(args.prepared_run)
+    data = _load_city_data(prepared)
+    with Run.start(args.city, "ahp-stability", cfg) as run:
+        for name in ("manifest.json", "times.npz", "cell_features.parquet"):
+            run.record_input(prepared / name)
+        draws, summary, ties = study(data, cfg)
+        for table, name in ((draws, "ahp_draws.csv"), (summary, "ahp_stability.csv"),
+                            (ties, "ahp_ties.csv")):
+            table.to_csv(run.dir / name, index=False, encoding="utf-8")
+            run.record_output(run.dir / name)
+
+    print(summary.round(3).to_string(index=False))
+    print()
+    print(ties.to_string(index=False))
     print(f"\nрезультаты: {run.dir}")
     return 0
 
@@ -857,10 +885,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--raw", nargs="*", default=None)
     p.set_defaults(func=cmd_package_results)
 
-    p = sub.add_parser("step2", help="шаг 2: A, B, M, BN и М2 без снимков")
+    p = sub.add_parser("step2", help="шаг 2: все варианты без снимков и М2")
     p.add_argument("city")
     p.add_argument("prepared_run", help="папка прогона prepare-city")
     p.set_defaults(func=cmd_step2)
+
+    p = sub.add_parser("ahp-stability", help="устойчивость E: Монте-Карло")
+    p.add_argument("city")
+    p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.set_defaults(func=cmd_ahp_stability)
 
     p = sub.add_parser("acquire-imagery", help="снимки по клеткам")
     p.add_argument("city")

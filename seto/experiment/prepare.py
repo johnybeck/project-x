@@ -31,6 +31,7 @@ from ..data import registry as registry_mod
 from ..routing import graph as graph_mod
 from ..routing import matrix as matrix_mod
 from ..sites import feasible as sites_mod
+from ..variants import ahp as ahp_mod
 
 
 @dataclass
@@ -54,6 +55,9 @@ class CityData:
     # откуда жители клетки: cell_id, code, total; нужно, чтобы перенести на клетки
     # доход участков (М4). В признаки не входит: модель эталона не видит
     cell_sections: pd.DataFrame | None = None
+    # критерии GIS-AHP: минуты пешком до главных дорог и до плотных районов
+    road_times: np.ndarray | None = None
+    dense_times: np.ndarray | None = None
 
     def save(self, out_dir: Path) -> dict[str, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -77,10 +81,12 @@ class CityData:
             lon=self.clinics.to_crs(4326).geometry.x,
             lat=self.clinics.to_crs(4326).geometry.y).to_csv(
                 paths["clinics"], index=False, encoding="utf-8")
+        layers = {} if self.road_times is None else {"to_roads": self.road_times,
+                                                     "to_dense": self.dense_times}
         np.savez_compressed(paths["times"], base=self.base_times,
                             clinics=self.clinic_times,
                             sites=self.site_times, site_index=self.site_index,
-                            allowed=self.allowed_pairs)
+                            allowed=self.allowed_pairs, **layers)
         self.grid.iloc[self.site_index][["cell_id", "geometry"]].to_parquet(
             paths["sites"])
         if self.cell_sections is not None:
@@ -320,6 +326,18 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         say("матрица площадок", shape=list(site_times.shape),
             max_feasible_k=feasible_k)
 
+    with costs.stage("ahp_layers", SHARED) as extra:
+        # те же сеть и привязка, что у всех времён: пропозал требует расстояний по сети
+        main_roads = matrix_mod.road_nodes(graph, roads, cfg["osm"]["main_roads"], snap_max)
+        road_times = matrix_mod.nearest_source(graph, main_roads, cells_snapped, t_max)
+        dense = ahp_mod.dense_cells(population, cfg["ahp"]["dense_share"])
+        dense_nodes = cells_snapped.node[dense & cells_snapped.attached]
+        dense_times = matrix_mod.nearest_source(graph, np.unique(dense_nodes),
+                                                cells_snapped, t_max)
+        dense_times[dense] = 0.0        # плотная клетка сама и есть плотный район
+        extra.update({"road_nodes": len(main_roads), "dense_cells": int(dense.sum())})
+        say("слои AHP", road_nodes=len(main_roads), dense_cells=int(dense.sum()))
+
     report = {
         "name": city,
         "snapshot_date": cfg.get("snapshot_date"),
@@ -345,7 +363,8 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                     clinic_times=clinic_times,
                     site_times=site_times, site_index=chosen.index,
                     allowed_pairs=allowed, report=report, groups=groups,
-                    districts=districts, cell_sections=cell_sections)
+                    districts=districts, cell_sections=cell_sections,
+                    road_times=road_times, dense_times=dense_times)
     data.save(out_dir)
     return data
 

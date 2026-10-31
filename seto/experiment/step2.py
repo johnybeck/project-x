@@ -1,4 +1,5 @@
 """Шаг 2 пропозала v2 (п. 3.9): A, B, M, BN и М2 — без снимков и без модели.
+Заодно считаются E, EN и EP: им тоже не нужны ни снимки, ни модель.
 
 Самый дешёвый ответ на вопрос «есть ли снимку что закрывать». Если потолок
 М2 везде ниже порога шума, это результат о постановке, и прогоны VLM можно
@@ -34,13 +35,13 @@ def needs_for(data, cfg: dict) -> dict[str, np.ndarray]:
 
 def coverage_by_k(metrics: pd.DataFrame, random_a: pd.DataFrame,
                   threshold: int) -> pd.DataFrame:
-    """Главная метрика по k: ΔCov_T у A (медиана и p95), B, BN и M."""
+    """Главная метрика по k: ΔCov_T у A (медиана и p95) и остальных вариантов."""
     column = f"dCov_{threshold}"
     table = metrics.pivot(index="k", columns="variant", values=column)
     spread = random_a.groupby("k")["dCov"]
     result = pd.DataFrame({"A_median": spread.median(),
                            "A_p95": spread.quantile(0.95)})
-    for name in ("B", "BN", "M"):
+    for name in ("B", "BN", "M", "E", "EN", "EP"):
         if name in table.columns:
             result[name] = table[name]
     return result.reset_index()

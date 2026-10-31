@@ -121,6 +121,29 @@ targeting:
   ede_epsilon_sensitivity: [-0.5, -2.0]  # проверка устойчивости
   walk_speed_seniors_m_per_min: 60       # пешеходы 65+, Highway Capacity Manual
 
+# GIS-AHP, варианты E, EN, EP (пропозал v2, п. 3.6). Источник — Dutta et al. (2022),
+# GeoJournal 87(6), PMC8540883. Веса не меняются ни в одном городе.
+ahp:
+  # критерии в порядке таблиц 5 и 6 статьи: расстояние до существующих учреждений,
+  # трущоб, главных дорог, районов высокой плотности, бедных районов
+  criteria: [network, slums, roads, dense, poverty]
+  matrix:                        # таблица 5, верхний треугольник по строкам
+    - [3, 3, 3, 2]
+    - [2, 2, 2]
+    - [3, 2]
+    - [2]
+  published_weights: [0.387907, 0.209253, 0.176037, 0.12067, 0.106133]   # таблица 6
+  excluded: [slums, poverty]     # аналогов в открытых данных нет
+  # Дальше — наши решения: порогов и правила выбора в статье нет.
+  dense_share: 0.25              # плотные районы — верхняя четверть клеток с жителями
+  classes: 4                     # квартили по допустимым клеткам
+  stability:                     # проверка устойчивости E, Монте-Карло
+    draws: 1000
+    weight_spread: 0.2           # каждый вес × U[0,8; 1,2]
+    schemes: [4, 5, "continuous"]
+    weight_methods: ["published", "eigenvector", "submatrix"]
+    tie_rules: ["population_T", "population_cell", "cell_order"]
+
 # --- Допустимые площадки ---
 # [Д7] — правило пока черновое, требует подтверждения.
 # Клетка отсекается, если ЛЮБОЕ условие ниже не выполнено (sites/feasible.py).
@@ -146,8 +169,8 @@ feasible_site:
   max_military_share: 0.5
 
 # --- Теги OSM ---
-# Код читает отсюда только clinic_tags и walk_network. Списки landuse,
-# buildings, main_roads и poi — справочные: фактические списки зашиты в
+# Код читает отсюда только clinic_tags, main_roads и walk_network. Списки
+# landuse, buildings и poi — справочные: фактические списки зашиты в
 # data/osm_layers.py и data/features.py, и правка здесь ничего не изменит.
 osm:
   clinic_tags:
