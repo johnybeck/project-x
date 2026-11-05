@@ -150,9 +150,17 @@ registry:
     "не первичная помощь":
       column: centro_tipo
       values: ["Centro de salud", "Consultorio de atención primaria"]
+    # Подчинение ИЛИ имущество — служба здоровья региона. Только по подчинению
+    # выпадали два работающих центра SERMAS: Las Tablas (CS19930, «Instituto de
+    # Salud Carlos III») и Andrés Mellado (CS17064, «Cruz Roja»). Только по
+    # имуществу выпал бы Baviera (CS19950, «Otros Administración Central»).
+    # Сверка с каталогом Минздрава — docs/MADRID_DATA.md, п. 2.
     "не государственная сеть региона":
-      column: dependecia_funcional
-      values: ["Servicios o Institutos de Salud de las CC.AA"]
+      any_of:
+        - column: dependecia_funcional
+          values: ["Servicios o Institutos de Salud de las CC.AA"]
+        - column: dependecia_patrimonial
+          values: ["Servicio Madrileño de Salud"]
   # Центры сети без координат в реестре. Каждый найден в OSM как центр
   # здоровья на той же улице (и с тем же номером дома, где он есть);
   # координаты — центроид объекта OSM в EPSG:25830, выгрузка 28.10.2026.

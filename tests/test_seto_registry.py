@@ -132,6 +132,44 @@ def test_manual_point_must_say_where_it_came_from(tmp_path):
         RG.load(path, {**RULES, "manual_points": {"CS2": {"x": 1, "y": 2}}})
 
 
+ANY_OF = {
+    **RULES,
+    "require": {
+        "не первичная помощь": RULES["require"]["не первичная помощь"],
+        "не государственная": {"any_of": [{"column": "dep", "values": ["SERMAS"]},
+                                          {"column": "own", "values": ["SERMAS"]}]},
+    },
+}
+
+
+def any_of_csv(tmp_path, *rows) -> Path:
+    path = tmp_path / "registry.csv"
+    path.write_text("\n".join(["id;tipo;dep;own;muni;x;y", *rows]) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def test_any_of_rule_passes_when_one_condition_holds(tmp_path):
+    """Как Las Tablas в Мадриде: подчинение странное, имущество — SERMAS.
+    Центр остаётся в сети; не прошедший ни одного условия — исключён."""
+    path = any_of_csv(tmp_path,
+                      "CS1;Centro de salud;SERMAS;Estado;Madrid;440000;4474000",
+                      "CS2;Centro de salud;ISCIII;SERMAS;Madrid;440100;4474000",
+                      "CS3;Centro de salud;Estado;Estado;Madrid;440200;4474000")
+    sel = RG.load(path, ANY_OF)
+    assert sel.frame.index.tolist() == ["CS1", "CS2"]
+    assert sel.excluded_by == {"не первичная помощь": 0, "не государственная": 1}
+
+
+def test_any_of_columns_must_agree_within_one_centre(tmp_path):
+    """Поле из any_of тоже обязано совпадать у всех строк учреждения."""
+    path = any_of_csv(tmp_path,
+                      "CS1;Centro de salud;ISCIII;SERMAS;Madrid;440000;4474000",
+                      "CS1;Centro de salud;ISCIII;Estado;Madrid;440000;4474000")
+    with pytest.raises(ValueError, match="own"):
+        RG.load(path, ANY_OF)
+
+
 def test_counts_always_add_up(tmp_path):
     path = csv(tmp_path,
                "CS1;Centro de salud;SERMAS;Madrid;x;440000;4474000",

@@ -72,7 +72,8 @@ def collapse(rows: pd.DataFrame, rules: dict) -> pd.DataFrame:
     молча взять первое — значит угадывать."""
     id_column = rules["id_column"]
     columns = [rules["scope"]["column"],
-               *(rule["column"] for rule in rules.get("require", {}).values())]
+               *(part["column"] for rule in rules.get("require", {}).values()
+                 for part in _parts(rule))]
     for column in columns:
         variants = rows.groupby(id_column)[column].nunique(dropna=False)
         conflicting = variants[variants > 1]
@@ -88,6 +89,23 @@ def _matches(values: pd.Series, allowed: list[str]) -> pd.Series:
     return values.fillna("").str.strip().isin([v.strip() for v in allowed])
 
 
+def _parts(rule: dict) -> list[dict]:
+    """Условия правила: одно {column, values} или несколько в any_of.
+
+    any_of нужен, когда одно поле реестра врёт: в Мадриде у двух работающих
+    центров SERMAS странное подчинение, но имущество записано за SERMAS
+    (сверка с каталогом Минздрава, MADRID_DATA п. 2)."""
+    return rule["any_of"] if "any_of" in rule else [rule]
+
+
+def _passes(centres: pd.DataFrame, rule: dict) -> pd.Series:
+    """Учреждение проходит правило, если выполнено хотя бы одно его условие."""
+    passed = pd.Series(False, index=centres.index)
+    for part in _parts(rule):
+        passed |= _matches(centres[part["column"]], part["values"])
+    return passed
+
+
 def select(centres: pd.DataFrame, rules: dict) -> RegistrySelection:
     """Отобрать сеть по правилам конфига и поставить точки на карту."""
     scope = rules["scope"]
@@ -96,7 +114,7 @@ def select(centres: pd.DataFrame, rules: dict) -> RegistrySelection:
     remaining = candidates
     excluded_by: dict[str, int] = {}
     for rule_name, rule in rules.get("require", {}).items():
-        passed = _matches(remaining[rule["column"]], rule["values"])
+        passed = _passes(remaining, rule)
         excluded_by[rule_name] = int((~passed).sum())
         remaining = remaining[passed]
 

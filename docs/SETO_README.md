@@ -22,7 +22,7 @@ python -m seto prepare-city madrid                         # подготовк�
 python -m seto step2 madrid <папка prepare-city>           # всё, что считается без модели, 43 минуты
 python -m seto ahp-stability madrid <папка prepare-city>   # устойчивость E, 3 секунды
 python -m seto acquire-imagery madrid <папка prepare-city> # снимки, около 2 часов
-pytest tests/                                              # 556 тестов, около 2 минут
+pytest tests/                                              # 558 тестов, около 4 минут
 ```
 
 Дальше нужен сервер модели. Порядок обязателен: одна клетка, потом 10, потом город.
