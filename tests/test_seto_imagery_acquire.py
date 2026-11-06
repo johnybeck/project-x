@@ -291,3 +291,11 @@ def test_set_with_a_missing_cell_is_not_loaded(tmp_path):
     """Частичный D сравнивать нельзя."""
     (tmp_path / "cell_000000.png").write_bytes(b"x")
     assert runner._load_images(tmp_path, ["cell_000000", "cell_000001"]) is None
+
+
+def test_images_are_paths_not_bytes(tmp_path):
+    """Снимки Мадрида — 4 ГБ: в память их не грузим, клиент читает по одному."""
+    for name in ("cell_000000", "cell_000001"):
+        (tmp_path / f"{name}.png").write_bytes(b"x")
+    paths = runner._load_images(tmp_path, ["cell_000000", "cell_000001"])
+    assert paths == [tmp_path / "cell_000000.png", tmp_path / "cell_000001.png"]

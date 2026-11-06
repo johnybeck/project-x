@@ -66,6 +66,10 @@ def _score_variant(key: str, cell_ids, inputs, cfg: dict, run_dir: Path,
         with costs.stage("scoring", f"variant:{variant}") as extra:
             scores, report = scoring_client.score_cells(
                 cell_ids, inputs, mode, cfg, cache, run_dir / f"vlm_raw_{key}")
+            if report.failures:
+                # в отчёт идут первые 20 причин, а разбирать сбои нужно по всем
+                (run_dir / f"vlm_failures_{key}.txt").write_text(
+                    "\n".join(report.failures) + "\n", encoding="utf-8")
             scoring_client.check_imputed(report, cfg)
             extra.update(report.as_dict())
         scores.to_parquet(run_dir / f"scores_{key}.parquet")
@@ -180,12 +184,13 @@ def _imagery_dir(cfg: dict, city: str, image_set: str | None = None) -> Path:
     return folder / name
 
 
-def _load_images(folder: Path, cell_ids) -> list[bytes] | None:
-    """Снимки клеток, если они загружены (п. 5). Иначе None.
+def _load_images(folder: Path, cell_ids) -> list[Path] | None:
+    """Пути к снимкам клеток, если все они загружены (п. 5). Иначе None.
 
     Файлы лежат в folder по одному PNG на клетку, обрезанные ровно по её
     квадрату. Нет хотя бы одного — вариант D не считается целиком, частичный D
-    сравнивать нельзя."""
+    сравнивать нельзя. Возвращаются пути, а не байты: снимки Мадрида занимают
+    4 ГБ, и клиент модели читает каждый в момент вызова."""
     if not folder.is_dir():
         return None
     images = []
@@ -193,5 +198,5 @@ def _load_images(folder: Path, cell_ids) -> list[bytes] | None:
         path = folder / f"{cell_id}.png"
         if not path.is_file():
             return None
-        images.append(path.read_bytes())
+        images.append(path)
     return images

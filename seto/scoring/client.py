@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from . import rules
-from .prompt import RATINGS, build, prompt_hash
+from .prompt import RATINGS, UNKNOWN, build, prompt_hash
 
 
 class ScoreSchemaError(ValueError):
@@ -42,6 +42,8 @@ class ScoringReport:
     completion_tokens: int = 0
     seconds: float = 0.0
     failures: list[str] = field(default_factory=list)
+    # сколько клеток ответили вне списка, по признакам (PARSE_RULE)
+    off_list: dict[str, int] = field(default_factory=dict)
 
     @property
     def imputed_share(self) -> float:
@@ -54,6 +56,7 @@ class ScoringReport:
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "seconds": round(self.seconds, 1),
+                "off_list": dict(self.off_list),
                 "failures": self.failures[:20]}
 
 
@@ -62,11 +65,23 @@ def _label(value) -> str:
     return str(value).strip().lower().replace("–", "-").replace("—", "-")
 
 
+PARSE_RULE = (
+    "ответ модели, где признак вне списка допустимых, не отбрасывается целиком: "
+    "этот признак становится «не определить», остальные сохраняются, исходное "
+    "значение пишется рядом (off_list). Нет поля или нет JSON — сбой, как раньше "
+    "(решение Д24)")
+
+
 def parse_response(raw: str | None) -> dict:
     """Разобрать ответ и проверить: все подоценки на месте, ответы из списка.
 
     Пустой content бывает у reasoning-моделей, когда рассуждение съело весь
-    лимит токенов, — это ошибка разбора, а не «ноль»."""
+    лимит токенов, — это ошибка разбора, а не «ноль».
+
+    Ответ вне списка — не сбой всей клетки, а «не определить» в одном поле
+    (PARSE_RULE). Иначе одно лишнее слово в назначении клетки стирало и эпоху,
+    из которой считается скор: в Мадриде так терялись 6,5 % жителей у D и ни
+    одного у C, и D − C мерила бы сбои разбора, а не снимок."""
     if not raw or not raw.strip():
         raise ScoreSchemaError("пустой ответ модели")
 
@@ -82,17 +97,26 @@ def parse_response(raw: str | None) -> dict:
     except json.JSONDecodeError as error:
         raise ScoreSchemaError(f"невалидный JSON: {error}") from error
 
-    parsed = {}
+    parsed, off_list = {}, {}
     for name, allowed in RATINGS.items():
         if name not in data:
             raise ScoreSchemaError(f"в ответе нет поля {name}: {data}")
         label = _label(data[name])
         if label not in allowed:
-            raise ScoreSchemaError(f"{name}: ответа {data[name]!r} нет в списке")
+            off_list[name] = data[name]
+            label = UNKNOWN
         parsed[name] = label
 
     parsed["rationale"] = str(data.get("rationale", ""))
+    if off_list:
+        parsed["off_list"] = off_list
     return parsed
+
+
+def _off_list_text(parsed: dict) -> str:
+    """Что модель ответила вне списка, одной строкой для таблицы скоров."""
+    return "; ".join(f"{name}={value}"
+                     for name, value in parsed.get("off_list", {}).items())
 
 
 def _input_hash(mode: str, payload: str | bytes) -> str:
@@ -189,7 +213,9 @@ def _message(prompt: str, mode: str, payload) -> list:
 
 def score_cells(cell_ids, inputs, mode: str, cfg: dict,
                 cache_dir: Path, raw_dir: Path | None = None):
-    """Скоры по всем клеткам. inputs — тексты (mode='text') или байты (mode='image').
+    """Скоры по всем клеткам. inputs — тексты (mode='text') или снимки (mode='image'):
+    байты или пути к PNG. Путь читается в момент вызова, чтобы город не держал все
+    снимки в памяти разом.
 
     Возвращает (DataFrame[cell_id, подоценки, rationale, imputed, score],
     ScoringReport). Скор считается здесь, а не кэшируется: кэш хранит только
@@ -214,6 +240,8 @@ def score_cells(cell_ids, inputs, mode: str, cfg: dict,
     def one(item):
         nonlocal client
         cell_id, payload = item
+        if isinstance(payload, Path):
+            payload = payload.read_bytes()
         prompt = build(mode, size_m, payload if mode == "text" else None)
         path = cache_dir / f"{cache_key(cell_id, vlm['model'], prompt, mode, payload)}.json"
         if path.is_file():
@@ -258,11 +286,14 @@ def score_cells(cell_ids, inputs, mode: str, cfg: dict,
             if parsed is None:
                 report.failures.append(error)
                 rows.append({"cell_id": cell_id, **dict.fromkeys(RATINGS),
-                             "rationale": "", "imputed": True})
+                             "rationale": "", "off_list": "", "imputed": True})
             else:
+                for name in parsed.get("off_list", {}):
+                    report.off_list[name] = report.off_list.get(name, 0) + 1
                 rows.append({"cell_id": cell_id,
                              **{name: parsed[name] for name in RATINGS},
-                             "rationale": parsed["rationale"], "imputed": False})
+                             "rationale": parsed["rationale"],
+                             "off_list": _off_list_text(parsed), "imputed": False})
 
     scores = pd.DataFrame(rows)
     scores["score"] = rules.score(scores, rule)

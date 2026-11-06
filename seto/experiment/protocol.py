@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..run import git_state, sha256_of
+from ..scoring import client as scoring_client
 from ..scoring import prompt as prompt_mod
 from .evaluate import CHAIN
 
@@ -78,6 +79,7 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
             "text_template_version": prompt_mod.TEXT_TEMPLATE_VERSION,
         },
         "prompt_diff": prompt_mod.diff(),
+        "answer_parsing": scoring_client.PARSE_RULE,
         "parameters": {key: cfg[key] for key in (
             "scenario", "k", "k_sensitivity", "T_minutes", "T_sensitivity",
             "walk_speed_m_per_min", "t_max_minutes", "snap_max_m",
@@ -242,6 +244,8 @@ def _markdown(protocol: dict) -> str:
     for name, text in protocol["pilot_criteria"].items():
         lines.append(f"- **{name}**: {text}")
     lines += ["", "## Отступления от пропозала", ""]
+    if protocol.get("answer_parsing"):
+        lines.append(f"- **все города**: {protocol['answer_parsing']}")
     for city, rules in protocol["city_rules"].items():
         lines += [f"- **{city}**: {item}" for item in rules.get("deviations", [])]
     lines += ["", "## Данные и лицензии", ""]

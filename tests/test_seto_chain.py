@@ -312,6 +312,7 @@ def test_protocol_page_lists_deviations_and_licenses(clean_tree, tmp_path):
     _, md_path = _freeze(tmp_path)
     text = md_path.read_text(encoding="utf-8")
     assert "0,56 м на пиксель" in text
+    assert "**все города**: ответ модели, где признак вне списка" in text
     assert "ODbL" in text
     assert "D − C" in text
 

@@ -184,16 +184,26 @@ def test_empty_content_is_an_error_not_zero():
             CL.parse_response(value)
 
 
-def test_label_outside_the_list_is_rejected():
-    raw = json.dumps(_answer(epoch="1960-е"), ensure_ascii=False)
-    with pytest.raises(CL.ScoreSchemaError, match="нет в списке"):
-        CL.parse_response(raw)
+def test_label_outside_the_list_becomes_unknown_in_that_field_only():
+    """Так в Мадриде отвечал D: «смешанное» в назначении. Ответ про эпоху,
+    из которой считается скор, при этом не должен пропадать."""
+    raw = json.dumps(_answer(purpose="смешанное", epoch="до 1955"), ensure_ascii=False)
+    parsed = CL.parse_response(raw)
+    assert parsed["purpose"] == P.UNKNOWN
+    assert parsed["epoch"] == "до 1955"
+    assert parsed["off_list"] == {"purpose": "смешанное"}
+    kept = {k: v for k, v in _answer(epoch="до 1955").items() if k != "purpose"}
+    assert all(parsed[k] == v for k, v in kept.items())
 
 
-def test_number_instead_of_label_is_rejected():
+def test_number_instead_of_label_is_kept_as_the_model_said_it():
     raw = json.dumps(_answer(epoch=1960), ensure_ascii=False)
-    with pytest.raises(CL.ScoreSchemaError, match="нет в списке"):
-        CL.parse_response(raw)
+    parsed = CL.parse_response(raw)
+    assert parsed["epoch"] == P.UNKNOWN and parsed["off_list"] == {"epoch": 1960}
+
+
+def test_answer_inside_the_list_has_no_off_list_mark():
+    assert "off_list" not in CL.parse_response(json.dumps(_answer(), ensure_ascii=False))
 
 
 def test_every_rating_is_required():
@@ -246,6 +256,24 @@ def test_cached_cells_do_not_call_the_api(tmp_path):
     assert scores["epoch"].iloc[0] == "до 1955"
     assert scores["score"].iloc[0] == RULE["points"]["до 1955"]
     assert report.from_cache == 1 and report.api_calls == 0
+
+
+def test_image_path_gives_the_same_cache_key_as_its_bytes(tmp_path):
+    """Путь читается при вызове: ключ кэша тот же, что у байтов, и прежние ответы
+    по снимкам находятся."""
+    image = tmp_path / "cell_000001.png"
+    image.write_bytes(b"\x89PNG-image")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    prompt = P.build("image", 500)
+    key = CL.cache_key("cell_000001", "m", prompt, "image", image.read_bytes())
+    (cache / f"{key}.json").write_text(
+        json.dumps(_answer(epoch="1955-1975"), ensure_ascii=False), encoding="utf-8")
+
+    scores, report = CL.score_cells(["cell_000001"], [image], "image", _scoring_cfg(),
+                                    cache)
+    assert report.from_cache == 1 and report.api_calls == 0
+    assert scores["epoch"].iloc[0] == "1955-1975"
 
 
 def test_every_rating_is_kept_for_m4(tmp_path):
@@ -309,6 +337,41 @@ def test_failed_cells_get_median_and_are_flagged(tmp_path, monkeypatch):
     assert bool(scores.loc[scores.cell_id == "c", "imputed"].iloc[0])
     assert scores.loc[scores.cell_id == "c", "epoch"].isna().all()
     assert report.failures and "модель недоступна" in report.failures[0]
+
+
+class _OffListClient:
+    """Клиент, который отвечает «смешанное» в назначении клетки."""
+
+    class chat:                                     # noqa: N801
+        class completions:                          # noqa: N801
+            @staticmethod
+            def create(**_kwargs):
+                from types import SimpleNamespace
+                content = json.dumps(_answer(purpose="смешанное", epoch="до 1955"),
+                                     ensure_ascii=False)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))
+
+
+def test_off_list_answer_scores_the_cell_and_is_reported(tmp_path, monkeypatch):
+    """Клетка с признаком вне списка не imputed: скор из эпохи, а что ответила
+    модель — в таблице, в кэше и в отчёте."""
+    monkeypatch.setattr(CL, "_make_client", lambda _cfg: _OffListClient())
+    scores, report = CL.score_cells(["a"], ["x"], "text", _scoring_cfg(), tmp_path,
+                                    tmp_path / "raw")
+    row = scores.iloc[0]
+    assert not row["imputed"] and row["purpose"] == P.UNKNOWN
+    assert row["score"] == RULE["points"]["до 1955"]
+    assert row["off_list"] == "purpose=смешанное"
+    assert report.imputed == 0 and report.as_dict()["off_list"] == {"purpose": 1}
+    cached = json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
+    assert cached["off_list"] == {"purpose": "смешанное"}
+
+    # второй запуск берёт тот же ответ из кэша и считает его так же
+    again, report = CL.score_cells(["a"], ["x"], "text", _scoring_cfg(), tmp_path)
+    assert report.from_cache == 1 and report.off_list == {"purpose": 1}
+    assert again["off_list"].iloc[0] == "purpose=смешанное"
 
 
 def test_missing_credentials_fail_loudly(tmp_path, monkeypatch):
