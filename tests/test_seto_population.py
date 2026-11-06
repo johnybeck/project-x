@@ -493,3 +493,60 @@ def test_merging_poi_keeps_columns_absent_in_polygons():
     result = F.build(grid, {"poi_polygons": poi_polygons}, None, points)
     assert result["transport_stops"].iloc[0] == 1
     assert result["schools"].iloc[0] == 1
+
+
+# --- выравнивание по датам (решение 05.11) ---
+
+def test_new_flats_get_no_residents(tmp_path):
+    """Дом 2024 года реестр жителей на 01.01.2024 не знает: жители участка A
+    достаются старым квартирам, а не делятся с новыми."""
+    from seto.data import catastro
+
+    flats = _flats((30, LEFT), (10, RIGHT), (10, FAR)).assign(
+        year=[2024.0, 1990.0, 1990.0], residential=True)
+    # 80 жителей на 10 старых квартир — выше порога 6, при нём участок ушёл бы в
+    # растр; здесь проверяется сама отсечка, поэтому порог шире
+    transfer = _by_dwellings(tmp_path, catastro.built_before(flats, 2024),
+                             _totals(A=(80, 8, 40, 32), B=(20, 0, 20, 0)), limit=20)
+    assert transfer.groups["total"].tolist() == pytest.approx([0, 100])
+    assert transfer.loss_share < 1e-9
+
+
+def test_cell_with_only_new_homes_has_no_epoch_reference():
+    """Дома моложе снимка не входят в эпохи: клетка, где жилья кроме них нет,
+    остаётся без эталона, а не получает «после 2000»."""
+    from seto.data import catastro
+    from seto.metrics import perception
+
+    grid = make_grid(cols=2)
+    old, new = Point(400_100, 6_199_600), Point(400_700, 6_199_600)
+    homes = _homes(*[(1960.0, old)] * 5, *[(2023.0, new)] * 5).assign(residential=True)
+    result = F.build(grid, {}, None, None, catastro.built_before(homes, 2023))
+    assert result["epoch_after_2000"].tolist() == [0, 0]
+    truth = perception.main_epoch(result.assign(cell_id=grid["cell_id"]), 5)
+    assert truth.tolist()[0] == "1955-1975" and truth.isna().tolist()[1]
+
+
+# --- проверка 1: GHS-POP внутри участков, возраст по долям участка (задача 3.5) ---
+
+def test_raster_by_sections_takes_people_from_raster_and_ages_from_section(tmp_path):
+    """Растр ровный, по пикселю на 100 м: в участке A 35 человек, в B 15. Реестр
+    задаёт только доли возраста: в A 40 % пожилых, в B ни одного."""
+    raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))
+    transfer = POP.raster_by_sections(raster, make_grid(), _sections(),
+                                      _totals(A=(80, 8, 40, 32), B=(20, 0, 20, 0)))
+    assert transfer.groups["total"].tolist() == pytest.approx([25, 25])
+    assert transfer.groups["seniors_65"].tolist() == pytest.approx([10, 4])
+    assert transfer.report["source_total"] == pytest.approx(50)
+    assert transfer.loss_share < 1e-9
+
+
+def test_raster_people_without_registry_get_city_shares(tmp_path):
+    """В участке B по реестру никого, а по растру 15 человек: возраст — доли
+    города, и участок попадает в отчёт."""
+    raster = make_raster(tmp_path / "pop.tif", np.ones((5, 10)))
+    transfer = POP.raster_by_sections(raster, make_grid(), _sections(),
+                                      _totals(A=(80, 8, 40, 32), B=(0, 0, 0, 0)))
+    assert transfer.groups["total"].sum() == pytest.approx(50)
+    assert transfer.groups["seniors_65"].sum() == pytest.approx(50 * 0.4)
+    assert transfer.report["sections_with_city_shares"] == {"B": pytest.approx(15)}

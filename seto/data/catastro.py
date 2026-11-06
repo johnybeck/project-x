@@ -81,6 +81,18 @@ def read(archive: Path, rules: dict) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(rows, geometry=shapes, crs=rules["crs"])
 
 
+def built_before(buildings: gpd.GeoDataFrame, year: int | None) -> gpd.GeoDataFrame:
+    """Здания, построенные раньше года year; year=None — все.
+
+    Кадастр описывает город 2026 года, а другие источники старше: реестр жителей —
+    на 01.01.2024, снимок — 07.2023. Дома, которых на дату источника ещё не было,
+    из сравнения с ним убираются (решение 05.11). Дом без года остаётся: про него
+    нельзя сказать, что он новый."""
+    if year is None:
+        return buildings
+    return buildings[~(buildings["year"] >= year)]
+
+
 def homes(buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Жилые здания точками: чтобы отнести здание к эпохе в клетке, контур не
     нужен, хватает точки внутри него."""

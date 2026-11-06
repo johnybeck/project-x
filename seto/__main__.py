@@ -225,7 +225,7 @@ def cmd_prepare_city(args: argparse.Namespace) -> int:
     import json
 
     from .costs.timer import CostLog
-    from .experiment.prepare import prepare_city
+    from .experiment.prepare import prepare_city, use_population_check
 
     cfg = config_mod.load(args.city)
     if args.snapshot_date:
@@ -234,6 +234,12 @@ def cmd_prepare_city(args: argparse.Namespace) -> int:
         print("не задан snapshot_date: укажи --snapshot-date или впиши в config",
               file=sys.stderr)
         return 1
+    if args.population_check:
+        try:
+            use_population_check(cfg, args.population_check)
+        except config_mod.ConfigError as error:
+            print(error, file=sys.stderr)
+            return 1
 
     costs = CostLog(mode=args.mode)
     with Run.start(args.city, "prepare-city", cfg) as run:
@@ -535,6 +541,45 @@ def cmd_step2(args: argparse.Namespace) -> int:
                                 if name in table.columns]]
     print()
     print(table[columns].to_string(index=False, **number))
+    print(f"\nрезультаты: {run.dir}")
+    return 0
+
+
+def cmd_compare_population(args: argparse.Namespace) -> int:
+    """Версии населения: порядок вариантов, разницы, М2, перекрёстная оценка (задача 3.5)."""
+    import pandas as pd
+
+    from .experiment import population_checks as checks
+
+    cfg = config_mod.load(args.city)
+    versions = [checks.Version(name, Path(prepared), Path(step2))
+                for name, prepared, step2 in args.version]
+    if len(versions) < 2:
+        print("нужны хотя бы две версии: основная и проверка", file=sys.stderr)
+        return 1
+    try:
+        checks.check_same_task(versions)
+    except ValueError as error:
+        print(f"версии нельзя сравнивать: {error}", file=sys.stderr)
+        return 1
+    main_need = cfg["city"]["need"]["main"]
+    table = pd.concat([checks.summary(v, main_need) for v in versions], ignore_index=True)
+    cross = checks.cross_evaluate(versions,
+                                  checks.main_need(versions[0].features(), cfg),
+                                  cfg["T_minutes"], cfg["t_max_minutes"])
+    with Run.start(args.city, "compare-population", cfg) as run:
+        for version in versions:
+            for folder in (version.prepared, version.step2):
+                run.record_input(folder / "manifest.json")
+        for frame, name in ((table, "versions.csv"), (cross, "cross.csv")):
+            frame.to_csv(run.dir / name, index=False, encoding="utf-8")
+            run.record_output(run.dir / name)
+
+    number = {"float_format": lambda v: f"{v:.2f}"}
+    print(table[["version", "k", "base_Cov_15", "A_p95", "B", "M", "order",
+                 "m2_ceiling_per_1000", "m2_noise_per_1000"]].to_string(index=False, **number))
+    print()
+    print(cross.drop(columns=["sites", "main_sites"]).to_string(index=False, **number))
     print(f"\nрезультаты: {run.dir}")
     return 0
 
@@ -883,6 +928,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", default="onboard_city",
                    choices=("dev_build", "onboard_city", "recompute"),
                    help="режим учёта затрат (п. 14)")
+    p.add_argument("--population-check", default=None,
+                   help="проверка населения из population.checks вместо основной раскладки")
     p.set_defaults(func=cmd_prepare_city)
 
     p = sub.add_parser("run-city", help="сквозной прогон города до отчёта")
@@ -952,6 +999,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--protocol", default=None,
                    help="protocol.json: сверка кода, правил, данных и готовых папок")
     p.set_defaults(func=cmd_step2)
+
+    p = sub.add_parser("compare-population",
+                       help="версии населения: порядок вариантов, М2, перекрёстная оценка")
+    p.add_argument("city")
+    p.add_argument("--version", nargs=3, action="append", required=True,
+                   metavar=("ИМЯ", "ПОДГОТОВКА", "STEP2"),
+                   help="первая — основная версия; папки prepare-city (или run-city) и step2")
+    p.set_defaults(func=cmd_compare_population)
 
     p = sub.add_parser("ahp-stability", help="устойчивость E: Монте-Карло")
     p.add_argument("city")

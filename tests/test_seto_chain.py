@@ -313,8 +313,19 @@ def test_protocol_page_lists_deviations_and_licenses(clean_tree, tmp_path):
     text = md_path.read_text(encoding="utf-8")
     assert "0,56 м на пиксель" in text
     assert "**все города**: ответ модели, где признак вне списка" in text
+    assert "**madrid**, реестр жителей (падрон): 01.01.2024 — P и N" in text
     assert "ODbL" in text
     assert "D − C" in text
+
+
+def test_verify_detects_changed_date_cutoff(clean_tree, tmp_path):
+    """Порог по году дома меняет P и эпохи — после заморозки его не сдвинуть."""
+    json_path, _ = _freeze(tmp_path)
+    cfg = settings.load("madrid")
+    assert proto.city_rules(cfg)["buildings"]["residents_from_year"] == 2024
+    cfg["city"]["buildings"]["epochs_from_year"] = 2024
+    result = proto.verify(json_path, cfg, {"madrid": "h"})
+    assert any("правила города madrid" in problem for problem in result["problems"])
 
 
 def test_verify_detects_changed_need_of_a_city(clean_tree, tmp_path):

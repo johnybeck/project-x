@@ -280,6 +280,41 @@ def registry_to_cells(raster_path: Path, grid: gpd.GeoDataFrame,
     return _sections_to_cells(pieces, grid, sections, totals, tolerance, details)
 
 
+def raster_by_sections(raster_path: Path, grid: gpd.GeoDataFrame,
+                       sections: gpd.GeoDataFrame, totals: pd.DataFrame,
+                       tolerance: float = 0.001) -> RegistryTransfer:
+    """Проверка 1, как в пропозале (п. 3.2, 3.3): и сколько людей, и где они —
+    по растру GHS-POP, а возрастные группы — по долям участка в реестре.
+
+    Растр берётся только внутри участков города: сеть — центры Мадрида, и жители
+    соседних городов к ней не относятся. Иначе версии населения различались бы не
+    только источником, но и территорией. Участок, где по реестру никого нет, а
+    по растру люди есть, получает доли групп всего города — это в отчёт."""
+    if grid.crs is None or grid.crs.is_geographic:
+        raise ValueError("сетка должна быть в метрической проекции (UTM)")
+
+    sections = sections.to_crs(grid.crs)
+    pixels = _section_pixels(raster_path, sections)
+    pieces = _cut_by_sections(pixels, sections)
+    raster_total = pieces.groupby("code")["weight"].sum()
+
+    known = totals[totals["total"] > 0]
+    city_shares = totals.sum() / totals["total"].sum()
+    shares = known.div(known["total"], axis=0).reindex(raster_total.index)
+    by_city = shares.index[shares["total"].isna()]
+    raster_totals = shares.fillna(city_shares).mul(raster_total, axis=0)
+
+    details = {
+        "method": "raster_by_sections",
+        "raster_total_in_window": round(float(pixels["weight"].sum()), 1),
+        "registry_total": round(float(totals["total"].sum()), 1),
+        "sections_with_city_shares": {code: round(float(raster_total[code]), 1)
+                                      for code in by_city},
+        "pixels_used": int(len(pixels)),
+    }
+    return _sections_to_cells(pieces, grid, sections, raster_totals, tolerance, details)
+
+
 def registry_by_dwellings(buildings: gpd.GeoDataFrame, raster_path: Path,
                           grid: gpd.GeoDataFrame, sections: gpd.GeoDataFrame,
                           totals: pd.DataFrame, max_people_per_dwelling: float,

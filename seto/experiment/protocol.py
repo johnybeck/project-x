@@ -21,7 +21,8 @@ from ..scoring import prompt as prompt_mod
 from .evaluate import CHAIN
 
 # что фиксируется по городу, кроме среза; остальное считается одинаково везде
-_CITY_KEYS = ("need", "population", "imagery", "income", "m4", "deviations")
+_CITY_KEYS = ("need", "population", "buildings", "imagery", "income", "m4",
+              "source_dates", "deviations")
 
 
 class ProtocolMismatch(RuntimeError):
@@ -248,6 +249,10 @@ def _markdown(protocol: dict) -> str:
         lines.append(f"- **все города**: {protocol['answer_parsing']}")
     for city, rules in protocol["city_rules"].items():
         lines += [f"- **{city}**: {item}" for item in rules.get("deviations", [])]
+    lines += ["", "## На какую дату источники описывают город", ""]
+    for city, rules in protocol["city_rules"].items():
+        lines += [f"- **{city}**, {item['source']}: {item['date']} — {item['used_for']}"
+                  for item in rules.get("source_dates", [])]
     lines += ["", "## Данные и лицензии", ""]
     for city, sources in protocol["data_sources"].items():
         lines += [f"- **{city}**, {item['name']}: {item['license']}, "

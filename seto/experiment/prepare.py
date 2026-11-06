@@ -117,7 +117,8 @@ _NETWORK_SOURCES = {
 }
 
 
-_POPULATION_METHODS = ("raster", "registry_by_raster", "registry_by_dwellings")
+_POPULATION_METHODS = ("raster", "raster_by_sections", "registry_by_raster",
+                       "registry_by_dwellings")
 
 
 def _base_network(cfg: dict, raw: Path, points: gpd.GeoDataFrame,
@@ -181,6 +182,9 @@ def _population(cfg: dict, raw: Path, grid: gpd.GeoDataFrame,
     if method == "registry_by_raster":
         transfer = population_mod.registry_to_cells(raster, grid, sections, totals.table,
                                                     tolerance)
+    elif method == "raster_by_sections":
+        transfer = population_mod.raster_by_sections(raster, grid, sections, totals.table,
+                                                     tolerance)
     else:
         transfer = population_mod.registry_by_dwellings(
             buildings, raster, grid, sections, totals.table,
@@ -203,6 +207,37 @@ def _buildings(cfg: dict, raw: Path, crs) -> gpd.GeoDataFrame | None:
         raise FileNotFoundError(
             f"нет {path}. Сначала `python -m seto acquire {cfg['city']['name']}`")
     return catastro_mod.read(path, rules).to_crs(crs)
+
+
+def use_population_check(cfg: dict, name: str) -> None:
+    """Заменить основную раскладку жителей проверкой из `population.checks` (задача 3.5).
+
+    Только из списка в конфиге: он входит в протокол, и карту населения нельзя
+    выбрать после результатов. Основной способ остаётся в `check_of` — по папке
+    прогона видно, что это проверка, а не основная версия."""
+    rules = cfg["city"].get("population") or {}
+    checks = rules.get("checks") or []
+    if name not in checks:
+        raise settings.ConfigError(
+            f"проверки населения {name!r} нет в population.checks города: {checks}")
+    cfg["city"]["population"] = {**rules, "method": name, "check_of": rules["method"]}
+
+
+def _cutoff(cfg: dict, key: str) -> int | None:
+    """Год, с которого дома кадастра не сравниваются с более старым источником
+    (`buildings.<key>` в конфиге города, решение 05.11). Нет ключа — без отсечки."""
+    return (cfg["city"].get("buildings") or {}).get(key)
+
+
+def _dropped(buildings: gpd.GeoDataFrame, year: int | None, name: str) -> dict:
+    """Сколько домов и квартир убрала отсечка по году — в отчёт подготовки."""
+    if year is None:
+        return {}
+    new = buildings["year"] >= year
+    return {f"{name}_from_year": year,
+            f"{name}_dropped_buildings": int(new.sum()),
+            f"{name}_dropped_residential": int((new & buildings["residential"]).sum()),
+            f"{name}_dropped_dwellings": int(buildings.loc[new, "dwellings"].sum())}
 
 
 def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
@@ -246,8 +281,14 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         buildings = _buildings(cfg, raw, crs)
 
     with costs.stage("population", SHARED) as extra:
-        transfer = _population(cfg, raw, grid, buildings)
+        residents_year = _cutoff(cfg, "residents_from_year")
+        transfer = _population(cfg, raw, grid,
+                               catastro_mod.built_before(buildings, residents_year)
+                               if buildings is not None else None)
         extra.update(transfer.as_dict())
+        # отсечка касается только раскладки по квартирам: растру кадастр не нужен
+        if buildings is not None and extra.get("method") == "registry_by_dwellings":
+            extra.update(_dropped(buildings, residents_year, "residents"))
         population = transfer.per_cell.to_numpy()
         groups = getattr(transfer, "groups", None)
         districts = getattr(transfer, "districts", None)
@@ -256,11 +297,14 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
             loss=transfer.loss_share)
 
     with costs.stage("features", SHARED) as extra:
-        homes = None if buildings is None else catastro_mod.homes(buildings)
+        epochs_year = _cutoff(cfg, "epochs_from_year")
+        homes = None if buildings is None else catastro_mod.homes(
+            catastro_mod.built_before(buildings, epochs_year))
         features = features_mod.build(grid, layers, roads, points, homes)
         if homes is not None:
             extra.update({"homes": len(homes),
-                          "homes_with_year": int(homes["year"].notna().sum())})
+                          "homes_with_year": int(homes["year"].notna().sum()),
+                          **_dropped(buildings, epochs_year, "epochs")})
         say("признаки", columns=len(features.columns))
 
     with costs.stage("clinics", SHARED) as extra:

@@ -113,3 +113,29 @@ def test_archive_without_buildings_file_is_an_error(tmp_path):
     archive = _archive(tmp_path / "bu.zip", name="другой.gml")
     with pytest.raises(ValueError, match="не один файл"):
         C.read(archive, RULES)
+
+
+# --- выравнивание по датам (решение 05.11) ---
+
+def _years(*years):
+    import geopandas as gpd
+    return gpd.GeoDataFrame({"year": list(years), "dwellings": [10] * len(years),
+                             "residential": [True] * len(years)},
+                            geometry=[box(0, 0, 1, 1)] * len(years), crs=25830)
+
+
+def test_cutoff_drops_buildings_from_that_year_on():
+    """Порог — год источника: дом 2024 года реестр жителей на 01.01.2024 не знает."""
+    kept = C.built_before(_years(2022.0, 2023.0, 2024.0, 2025.0), 2024)
+    assert kept["year"].tolist() == [2022.0, 2023.0]
+
+
+def test_cutoff_keeps_buildings_without_year():
+    """Без года нельзя сказать, что дом новый, — он остаётся."""
+    kept = C.built_before(_years(np.nan, 2030.0), 2023)
+    assert len(kept) == 1 and np.isnan(kept["year"].iloc[0])
+
+
+def test_no_cutoff_keeps_everything():
+    buildings = _years(2000.0, 2030.0)
+    assert C.built_before(buildings, None) is buildings
