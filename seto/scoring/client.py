@@ -296,18 +296,10 @@ def score_cells(cell_ids, inputs, mode: str, cfg: dict,
                              "off_list": _off_list_text(parsed), "imputed": False})
 
     scores = pd.DataFrame(rows)
-    scores["score"] = rules.score(scores, rule)
     report.imputed = int(scores["imputed"].sum())
     report.seconds = time.time() - started
-
-    if report.imputed:
-        # п. 7.1: сбойной клетке ставится медиана скоров города
-        median = scores["score"].median()
-        if pd.isna(median):
-            raise RuntimeError("ни одна клетка не получила скор — считать нечего")
-        scores.loc[scores["imputed"], "score"] = median
-
-    scores["score"] = scores["score"].astype(float)
+    # п. 7.1: сбойной клетке ставится медиана скоров города
+    scores["score"] = rules.score_filled(scores, rule)
     return scores, report
 
 

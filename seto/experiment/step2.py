@@ -47,6 +47,19 @@ def coverage_by_k(metrics: pd.DataFrame, random_a: pd.DataFrame,
     return result.reset_index()
 
 
+def starts_table(solutions: dict[str, list[dict]]) -> pd.DataFrame:
+    """Разброс между стартами эвристики: строка на k и вариант (пропозал v2, п. 3.4).
+
+    При k ≤ 2 решение точное, строк нет. `reached_best` — сколько стартов пришли к
+    лучшей цели, `distinct_solutions` — сколько разных наборов они нашли: если лучшая
+    цель найдена одним стартом из двадцати, решению при этом k верить нельзя."""
+    rows = [{"k": int(k), "variant": item["variant"], **item["spread"]}
+            for k, items in solutions.items() for item in items if item.get("spread")]
+    columns = ["k", "variant", "starts", "seed", "best", "worst", "median",
+               "reached_best", "distinct_solutions"]
+    return pd.DataFrame(rows, columns=columns)
+
+
 def run_step2(data, cfg: dict, out_dir: Path, logger=None,
               costs: CostLog | None = None,
               scores: dict[str, np.ndarray] | None = None) -> dict[str, Path]:
@@ -58,10 +71,11 @@ def run_step2(data, cfg: dict, out_dir: Path, logger=None,
     out_dir.mkdir(parents=True, exist_ok=True)
     k_values = cfg["m2"]["k_values"]
 
-    metrics, differences, solutions, random_a, captured = [], [], {}, [], {}
+    metrics, differences, solutions, random_a, captured, by_need = [], [], {}, [], {}, []
     for k in k_values:
         evaluation = run_variants(data, scores or {}, {**cfg, "k": k}, costs, logger)
         metrics.append(evaluation.table.assign(k=k))
+        by_need.append(evaluation.by_need.assign(k=k))
         differences.append(evaluation.differences.assign(k=k))
         solutions[str(k)] = [variant.as_dict() for variant in evaluation.variants]
         spread = next(v for v in evaluation.variants if v.name == "A").distribution
@@ -74,6 +88,12 @@ def run_step2(data, cfg: dict, out_dir: Path, logger=None,
     needs = needs_for(data, cfg)
     with costs.stage("m2", "shared_prep"):
         table, noise_sites = m2_mod.study(data, needs, cfg, k_values, logger, captured)
+    # рядом с захватом — что дают те же ответы модели, розданные клеткам наугад
+    scored = {name: scores[key] for key, name in SCORED_VARIANTS.items()
+              if key in (scores or {})}
+    with costs.stage("m2_permutations", "shared_prep"):
+        table, permutation_sites = m2_mod.with_permutations(
+            table, data, needs, cfg, captured, scored, logger)
 
     paths = {"solutions": out_dir / "solutions.json",
              "metrics": out_dir / "metrics.csv",
@@ -81,9 +101,18 @@ def run_step2(data, cfg: dict, out_dir: Path, logger=None,
              "random_A": out_dir / "random_A.parquet",
              "coverage_by_k": out_dir / "coverage_by_k.csv",
              "m2": out_dir / "m2.csv",
-             "m2_noise_sites": out_dir / "m2_noise_sites.json"}
+             "m2_noise_sites": out_dir / "m2_noise_sites.json",
+             "m2_permutation_sites": out_dir / "m2_permutation_sites.json",
+             "metrics_by_need": out_dir / "metrics_by_need.csv",
+             "starts": out_dir / "starts.csv"}
     paths["solutions"].write_text(json.dumps(solutions, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
+    starts_table(solutions).to_csv(paths["starts"], index=False, encoding="utf-8")
+    pd.concat(by_need).to_csv(paths["metrics_by_need"], index=False, encoding="utf-8")
+    paths["m2_permutation_sites"].write_text(
+        json.dumps({"parameters": cfg["m2"], "seed": cfg["seed"],
+                    "sites": {str(k): v for k, v in permutation_sites.items()}},
+                   ensure_ascii=False), encoding="utf-8")
     metrics.to_csv(paths["metrics"], index=False, encoding="utf-8")
     differences.to_csv(paths["differences"], index=False, encoding="utf-8")
     random_a.to_parquet(paths["random_A"])

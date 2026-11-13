@@ -20,9 +20,12 @@ from ..scoring import client as scoring_client
 from ..scoring import prompt as prompt_mod
 from .evaluate import CHAIN
 
+# корень репозитория: от него считаются пути рабочих документов (`protocol.reference_docs`)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # что фиксируется по городу, кроме среза; остальное считается одинаково везде
 _CITY_KEYS = ("need", "population", "buildings", "imagery", "income", "m4",
-              "source_dates", "deviations")
+              "feasible_site", "source_dates", "deviations")
 
 
 class ProtocolMismatch(RuntimeError):
@@ -49,6 +52,62 @@ def data_sources(manifests: dict[str, Path]) -> dict[str, list[dict]]:
                              ("name", "url", "license", "downloaded_at", "sha256")}
                             for source in sources]
     return result
+
+
+def declared_checks(cfg: dict, rules: dict[str, dict]) -> list[str]:
+    """Проверки устойчивости, объявленные до прогонов: одна строка на проверку.
+
+    Каждая считается и показывается при любом исходе, а список закрыт: проверку,
+    которой здесь нет, после заморозки посчитать нельзя. Собирается из тех же
+    разделов конфига, по которым проверки запускаются, а не пишется руками."""
+    lines = []
+    for name, note in (cfg.get("score_rule_checks") or {}).items():
+        points = cfg["score_rules"][name]["points"]
+        lines.append(f"все города, правило перевода `{name}` вместо "
+                     f"`{cfg['score_rule']}`: {note}; баллы: "
+                     + ", ".join(f"{label} — {value}" for label, value in points.items()))
+    stability = (cfg.get("ahp") or {}).get("stability") or {}
+    if stability:
+        parts = [f"веса ±{stability['weight_spread']:.0%}",
+                 f"схема классов {stability['schemes']}",
+                 f"способ весов {stability['weight_methods']}",
+                 f"правило ничьих {stability['tie_rules']}"]
+        if stability.get("dense_shares"):
+            parts.append(f"доля плотных клеток {stability['dense_shares']}")
+        if stability.get("main_roads"):
+            parts.append(f"главные дороги до {list(stability['main_roads'])}")
+        lines.append(f"все города, устойчивость E, Монте-Карло, {stability['draws']} "
+                     "повторов, всё меняется сразу: " + "; ".join(parts))
+    for city, rule in rules.items():
+        need = rule.get("need") or {}
+        extra = [name for name in need.get("definitions", {}) if name != need.get("main")]
+        if extra:
+            lines.append(f"{city}, определения нуждаемости кроме основного "
+                         f"`{need['main']}`: {', '.join(extra)}")
+        population = (rule.get("population") or {}).get("checks") or []
+        if population:
+            lines.append(f"{city}, источник населения: {', '.join(population)}")
+        sites = (rule.get("feasible_site") or {}).get("checks") or {}
+        if sites:
+            lines.append(f"{city}, правило допустимой площадки: {', '.join(sites)}")
+        if (rule.get("buildings") or {}).get("evaluate_from_homes"):
+            lines.append(f"{city}, оценка от домов: ΔCov_T и цепочка разниц тех же решений "
+                         "при времени от жилых домов, а не от центра клетки")
+    return lines
+
+
+def reference_docs(cfg: dict) -> dict[str, str]:
+    """Контрольные суммы рабочих документов, которые лежат вне git (Д22).
+
+    На них ссылаются комментарии конфига и список отступлений, а коммит протокола их
+    не содержит. Сумма называет версию, на которую смотрели при заморозке. Нет файла —
+    отказ: протокол со ссылкой на отсутствующий документ хуже, чем отсрочка."""
+    names = (cfg.get("protocol") or {}).get("reference_docs") or []
+    missing = [name for name in names if not (REPO_ROOT / name).is_file()]
+    if missing:
+        raise ProtocolMismatch(
+            f"нет рабочих документов из protocol.reference_docs: {', '.join(missing)}")
+    return {name: sha256_of(REPO_ROOT / name) for name in names}
 
 
 def _hash_payload(payload: dict) -> str:
@@ -86,8 +145,10 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
             "walk_speed_m_per_min", "t_max_minutes", "snap_max_m",
             "min_dist_to_existing_m", "min_dist_between_new_m",
             "alpha", "alpha_sensitivity", "score_rule", "score_rules",
+            "score_rule_checks",
             "random_draws", "seed", "swap_heuristic", "m2", "targeting", "ahp",
-            "pilot", "imputation_max_share", "feasible_site", "grid") if key in cfg},
+            "pilot", "imputation_max_share", "feasible_site", "grid",
+            "inference_rules", "protocol") if key in cfg},
         "cities": cities,
         "city_rules": rules or {},
         "data_sources": sources or {},
@@ -96,19 +157,22 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
         "metrics": ["Cov_T", "dCov_T", "dN_T", "worst_decile", "mean_time",
                     "2SFCA: share_below_floor, p10, p25",
                     "М1: Cov_N_T, dCov_N_T, dN_N_T, новые 65+, 65+ при медленной ходьбе",
-                    "М2: потолок, порог шума, доля захвата C, D, D10 при всех k",
+                    "М2: потолок, порог шума, доля захвата C, D, D10 при всех k; рядом "
+                    "доля перестановок ответов модели с захватом не ниже",
                     "М3: EDE, дефицит, Джини, Тейль с разложением, 2SFCA по N",
                     "М4: каппа эпохи у D, ранговая корреляция достатка с доходом"],
+        "declared_checks": declared_checks(cfg, rules or {}),
+        "inference_rules": cfg.get("inference_rules") or [],
+        "reference_docs": reference_docs(cfg),
         "pilot_criteria": {
             "quality": "dCov_T варианта D выше 95-го процентиля варианта A",
-            "costs": ("активное время человека на подключение нового города у D не "
-                      "более половины, чем у E; у E мерится: "
-                      f"{(cfg.get('pilot') or {}).get('e_cost_measure')}"),
+            "costs": _cost_text(cfg),
             "reliability": ("D дал допустимое решение без ручной правки; "
                             "при сбое допускается один перезапуск"),
         },
         "not_computed": ["порог допустимой потери δ", "порог ε",
-                         "среднее A_i по 2SFCA"],
+                         "среднее A_i по 2SFCA",
+                         *((cfg.get("protocol") or {}).get("not_implemented") or [])],
     }
     protocol["sha256"] = _hash_payload(protocol)
 
@@ -119,6 +183,17 @@ def freeze(cfg: dict, cities: dict[str, str], data_hashes: dict[str, str],
     md_path = out_dir / "protocol.md"
     md_path.write_text(_markdown(protocol), encoding="utf-8")
     return json_path, md_path
+
+
+def _cost_text(cfg: dict) -> str:
+    """Критерий затрат. Что мерится у E и чего от критерия ждать, пропозал велит
+    назвать заранее: оба текста лежат в конфиге (`pilot`), а не здесь."""
+    pilot = cfg.get("pilot") or {}
+    text = ("активное время человека на подключение нового города у D не более "
+            f"половины, чем у E; у E мерится: {pilot.get('e_cost_measure')}")
+    if pilot.get("e_cost_expectation"):
+        text += f". Заранее: {pilot['e_cost_expectation']}"
+    return text
 
 
 def verify(protocol_path: Path, cfg: dict,
@@ -244,6 +319,15 @@ def _markdown(protocol: dict) -> str:
     lines += ["", "## Критерии пилота", ""]
     for name, text in protocol["pilot_criteria"].items():
         lines.append(f"- **{name}**: {text}")
+    lines += ["", "## Проверки устойчивости, объявленные заранее", "",
+              "Считаются и показываются при любом исходе. Проверку, которой здесь нет, "
+              "после заморозки посчитать нельзя.", ""]
+    lines += [f"- {item}" for item in protocol.get("declared_checks", [])]
+    lines += ["", "## Правила вывода", "",
+              "Что из какого исхода следует. Строки без пометки — из пропозала.", ""]
+    for rule in protocol.get("inference_rules", []):
+        added = f" *Дописано нами: {rule.get('note', '')}*" if rule.get("source") == "added" else ""
+        lines.append(f"- **Если** {rule['if']} — **то** {rule['then']}.{added}")
     lines += ["", "## Отступления от пропозала", ""]
     if protocol.get("answer_parsing"):
         lines.append(f"- **все города**: {protocol['answer_parsing']}")
@@ -257,6 +341,11 @@ def _markdown(protocol: dict) -> str:
     for city, sources in protocol["data_sources"].items():
         lines += [f"- **{city}**, {item['name']}: {item['license']}, "
                   f"загружено {item['downloaded_at']}" for item in sources]
+    lines += ["", "## Рабочие документы вне репозитория", "",
+              "На них ссылаются правила городов и отступления. Контрольные суммы — на "
+              "момент заморозки.", ""]
+    lines += [f"- `{name}`: `{digest}`"
+              for name, digest in (protocol.get("reference_docs") or {}).items()]
     lines += ["", "## Чего эксперимент НЕ делает", ""]
     lines += [f"- {m}" for m in protocol["not_computed"]]
     lines += ["", "После просмотра результатов проверки ничего из этого "

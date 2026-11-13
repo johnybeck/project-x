@@ -44,8 +44,61 @@ def _cost_criterion(cfg: dict, costs: dict | None, human_log: Path | None) -> di
     city = (cfg.get("city") or {}).get("name")
     verdict = ({"status": "нет данных: журнал человеко-времени (log-human) не передан"}
                if human_log is None else human.cost_criterion(human_log, city))
-    return {**verdict, "E_measured_as": (cfg.get("pilot") or {}).get("e_cost_measure"),
+    pilot = cfg.get("pilot") or {}
+    return {**verdict, "E_measured_as": pilot.get("e_cost_measure"),
+            "stated_in_advance": pilot.get("e_cost_expectation"),
             "machine_time": costs or "журнал затрат не передан"}
+
+
+def gain_price(evaluation, cfg: dict, human_log: Path | None) -> dict:
+    """Цена прироста на одного жителя (пропозал v2, п. 3.10): «если D лучше, но
+    дороже». Сравнивается D с C — та же модель без изображения: разница в жителях —
+    то, что дало изображение, разница во времени человека — чего оно стоило.
+
+    Считается только при положительном приросте и только по записям журнала: без них
+    «нет данных», а не ноль."""
+    threshold = cfg["T_minutes"]
+    indexed = evaluation.table.set_index("variant")
+    if not {"D", "C"} <= set(indexed.index):
+        return {"status": "нет данных: вариант D или C не считался"}
+    delta = float(indexed.loc["D", f"dN_{threshold}"] - indexed.loc["C", f"dN_{threshold}"])
+    if delta <= 0:
+        return {"status": "не считается", "delta_people": delta,
+                "reason": "D не лучше C по главной метрике"}
+    if human_log is None:
+        return {"status": "нет данных: журнал человеко-времени (log-human) не передан",
+                "delta_people": delta}
+    minutes = human.onboard_minutes(human_log, (cfg.get("city") or {}).get("name"))
+    if not {"D", "C"} <= set(minutes):
+        return {"status": "нет данных: в журнале нет времени подключения D или C",
+                "delta_people": delta}
+    return human.price_of_gain(minutes["D"], minutes["C"], delta)
+
+
+def data_credits(cfg: dict, scoring: dict | None = None) -> list[str]:
+    """Источники данных и их лицензии — строками для отчёта.
+
+    Лицензии CC BY и условия кадастра требуют называть источник в производных
+    материалах, а отчёт города и есть такой материал. Наборы снимков называются те,
+    по которым в этом прогоне считался скор."""
+    city = cfg.get("city") or {}
+    sources = city.get("sources") or {}
+    lines = []
+    for key, title in (("osm_pbf", "OpenStreetMap"), ("population_raster", "растр населения")):
+        if (sources.get(key) or {}).get("license"):
+            lines.append(f"{title}: {sources[key]['license']}")
+    for name, table in (sources.get("tables") or {}).items():
+        if table.get("license"):
+            lines.append(f"{name}: {table['license']}")
+    imagery = city.get("imagery") or {}
+    used = {"image": imagery.get("main_set"), "image_10m": imagery.get("low_set")}
+    for key, set_name in used.items():
+        report = (scoring or {}).get(key) or {}
+        if not set_name or not report or report.get("status") in ("missing", "skipped", "failed"):
+            continue
+        rules = imagery["sets"][set_name]
+        lines.append(f"снимки {set_name}: {rules['attribution']} ({rules['license']})")
+    return lines
 
 
 def _reliability_criterion(evaluation, cfg: dict, human_log: Path | None) -> dict:
@@ -118,11 +171,17 @@ def build(evaluation, city_report: dict, cfg: dict, out_dir: Path,
                                   encoding="utf-8")
     evaluation.table.to_parquet(out_dir / "metrics.parquet")
     paths["metrics_main"] = out_dir / "metrics_main.csv"
+    by_need = getattr(evaluation, "by_need", None)
+    if by_need is not None and len(by_need):
+        by_need.to_csv(out_dir / "metrics_by_need.csv", index=False, encoding="utf-8")
+        paths["metrics_by_need"] = out_dir / "metrics_by_need.csv"
 
     summary = {
         "city": city_report,
         "variants": [v.as_dict() for v in evaluation.variants],
         "pilot_criteria": pilot_criteria(evaluation, cfg, costs, human_log),
+        "gain_price": gain_price(evaluation, cfg, human_log),
+        "data_credits": data_credits(cfg, scoring),
         "scoring": scoring or {},
         "costs": costs or {},
     }
@@ -214,8 +273,28 @@ def _markdown(main: pd.DataFrame, appendix: pd.DataFrame, evaluation,
               json.dumps(summary["pilot_criteria"], ensure_ascii=False, indent=2),
               "```", ""]
 
+    by_need = getattr(evaluation, "by_need", None)
+    if by_need is not None and len(by_need):
+        column = f"dCov_N_{threshold}"
+        pivot = (by_need[by_need["variant"] != "исходная сеть"]
+                 .pivot(index="variant", columns="need", values=column).reset_index())
+        lines += ["## М1 при других определениях нуждаемости", "",
+                  f"Прирост покрытия нуждающихся, {column}, п.п.; решения те же, меняется "
+                  "только определение N. Остальные метрики — `metrics_by_need.csv`.", "",
+                  md_table(pivot), ""]
+
+    lines += ["## Цена прироста: D против C", "",
+              "```json",
+              json.dumps(summary.get("gain_price", {}), ensure_ascii=False, indent=2),
+              "```", ""]
+
     statuses = {v.name: (v.status, v.note) for v in evaluation.variants}
     lines += ["## Статусы вариантов", ""]
     for name, (status, note) in statuses.items():
         lines.append(f"- **{name}**: {status}" + (f" — {note}" if note else ""))
+
+    credits = summary.get("data_credits") or []
+    if credits:
+        lines += ["", "## Источники данных и лицензии", ""]
+        lines += [f"- {item}" for item in credits]
     return "\n".join(lines) + "\n"

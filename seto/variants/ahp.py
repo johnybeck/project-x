@@ -79,6 +79,27 @@ def dense_cells(population: np.ndarray, share: float) -> np.ndarray:
     return people >= np.quantile(inhabited, 1 - share)
 
 
+def share_name(share: float) -> str:
+    """Имя порога плотности в файлах и таблицах: 0.1 → «0.10»."""
+    return f"{float(share):.2f}"
+
+
+_OPTION_PREFIX = {"roads": "to_roads__", "dense": "to_dense__"}
+
+
+def option_key(criterion: str, name: str) -> str:
+    """Под каким ключом слой при другом пороге лежит в times.npz."""
+    return _OPTION_PREFIX[criterion] + name
+
+
+def read_options(times) -> dict[str, dict[str, np.ndarray]] | None:
+    """Слои при других порогах из times.npz; None, если подготовка города их не считала."""
+    found = {criterion: {key[len(prefix):]: times[key] for key in times.files
+                         if key.startswith(prefix)}
+             for criterion, prefix in _OPTION_PREFIX.items()}
+    return found if any(found.values()) else None
+
+
 def need_share(data, cfg: dict) -> np.ndarray | None:
     """Доля пожилых в клетке, без жителей — 0; None, если возрастных групп нет."""
     groups = getattr(data, "groups", None)

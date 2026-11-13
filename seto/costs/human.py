@@ -65,6 +65,13 @@ def summary(path: Path) -> pd.DataFrame:
             .sum().sort_values(["city", "variant", "mode"]))
 
 
+def onboard_minutes(path: Path, city: str) -> dict[str, float]:
+    """Активное время человека на подключение города по вариантам, минуты."""
+    table = summary(path)
+    subset = table[(table["city"] == city) & (table["mode"] == "onboard_city")]
+    return subset.set_index("variant")["minutes"].to_dict()
+
+
 def cost_criterion(path: Path, city: str, reference: str = "E",
                    candidate: str = "D", ratio: float = 0.5) -> dict:
     """Критерий затрат (п. 18.3): время человека у D не больше половины от E.

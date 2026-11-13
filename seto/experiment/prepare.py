@@ -58,6 +58,9 @@ class CityData:
     # критерии GIS-AHP: минуты пешком до главных дорог и до плотных районов
     road_times: np.ndarray | None = None
     dense_times: np.ndarray | None = None
+    # те же критерии при других порогах — для проверки устойчивости E:
+    # {"roads": {имя набора дорог: минуты}, "dense": {доля клеток: минуты}}
+    ahp_options: dict[str, dict[str, np.ndarray]] | None = None
 
     def save(self, out_dir: Path) -> dict[str, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +86,9 @@ class CityData:
                 paths["clinics"], index=False, encoding="utf-8")
         layers = {} if self.road_times is None else {"to_roads": self.road_times,
                                                      "to_dense": self.dense_times}
+        for criterion, options in (self.ahp_options or {}).items():
+            layers.update({ahp_mod.option_key(criterion, name): values
+                           for name, values in options.items()})
         np.savez_compressed(paths["times"], base=self.base_times,
                             clinics=self.clinic_times,
                             sites=self.site_times, site_index=self.site_index,
@@ -221,6 +227,22 @@ def use_population_check(cfg: dict, name: str) -> None:
         raise settings.ConfigError(
             f"проверки населения {name!r} нет в population.checks города: {checks}")
     cfg["city"]["population"] = {**rules, "method": name, "check_of": rules["method"]}
+
+
+def use_site_check(cfg: dict, name: str) -> None:
+    """Заменить правило допустимой площадки проверкой из `feasible_site.checks`
+    (решение 10.11, PROPOSAL_CHANGES п. 15).
+
+    Только из списка в конфиге города: он входит в протокол, и правило нельзя
+    выбрать после результатов. Имя проверки остаётся в `check` — по папке прогона
+    видно, что это проверка, а не основная версия."""
+    rules = settings.setting(cfg, "feasible_site") or {}
+    checks = rules.get("checks") or {}
+    if name not in checks:
+        raise settings.ConfigError(
+            f"проверки правила площадки {name!r} нет в feasible_site.checks города: "
+            f"{sorted(checks)}")
+    cfg["city"]["feasible_site"] = {**rules, **checks[name], "check": name}
 
 
 def _cutoff(cfg: dict, key: str) -> int | None:
@@ -382,6 +404,11 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
         extra.update({"road_nodes": len(main_roads), "dense_cells": int(dense.sum())})
         say("слои AHP", road_nodes=len(main_roads), dense_cells=int(dense.sum()))
 
+        ahp_options = ahp_option_layers(graph, roads, cells_snapped, population, cfg,
+                                        road_times, dense_times)
+        extra.update({"road_options": list(ahp_options["roads"]),
+                      "dense_options": list(ahp_options["dense"])})
+
     report = {
         "name": city,
         "snapshot_date": cfg.get("snapshot_date"),
@@ -408,9 +435,40 @@ def prepare_city(city: str, cfg: dict, out_dir: Path, logger=None,
                     site_times=site_times, site_index=chosen.index,
                     allowed_pairs=allowed, report=report, groups=groups,
                     districts=districts, cell_sections=cell_sections,
-                    road_times=road_times, dense_times=dense_times)
+                    road_times=road_times, dense_times=dense_times,
+                    ahp_options=ahp_options)
     data.save(out_dir)
     return data
+
+
+def ahp_option_layers(graph, roads: gpd.GeoDataFrame, cells_snapped,
+                      population: np.ndarray, cfg: dict, road_times: np.ndarray,
+                      dense_times: np.ndarray) -> dict[str, dict[str, np.ndarray]]:
+    """Критерии GIS-AHP при других порогах — для Монте-Карло E (PROPOSAL_CHANGES п. 10).
+
+    Считаются так же, как основные слои: та же сеть, та же привязка клеток. Порог,
+    совпавший с основным, берёт основной слой, а не считается заново: основной E и
+    его повтор в Монте-Карло не могут разойтись."""
+    stability = cfg["ahp"].get("stability") or {}
+    snap_max, t_max = cfg["snap_max_m"], cfg["t_max_minutes"]
+    options: dict[str, dict[str, np.ndarray]] = {"roads": {}, "dense": {}}
+    for name, classes in (stability.get("main_roads") or {}).items():
+        if sorted(classes) == sorted(cfg["osm"]["main_roads"]):
+            options["roads"][name] = road_times
+            continue
+        nodes = matrix_mod.road_nodes(graph, roads, classes, snap_max)
+        options["roads"][name] = matrix_mod.nearest_source(graph, nodes, cells_snapped,
+                                                           t_max)
+    for share in stability.get("dense_shares") or []:
+        if share == cfg["ahp"]["dense_share"]:
+            options["dense"][ahp_mod.share_name(share)] = dense_times
+            continue
+        dense = ahp_mod.dense_cells(population, share)
+        nodes = cells_snapped.node[dense & cells_snapped.attached]
+        times = matrix_mod.nearest_source(graph, np.unique(nodes), cells_snapped, t_max)
+        times[dense] = 0.0              # плотная клетка сама и есть плотный район
+        options["dense"][ahp_mod.share_name(share)] = times
+    return options
 
 
 def _save_uncertain(uncertain: pd.DataFrame, path: Path) -> None:

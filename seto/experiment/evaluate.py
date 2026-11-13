@@ -35,11 +35,17 @@ class VariantResult:
     tie_count: int = 0
     note: str = ""
     distribution: np.ndarray | None = None   # только для A
+    # только у эвристики (k > 2): цели всех стартов; пропозал v2, п. 3.4 — «разброс
+    # между стартами приводится»
+    spread: dict | None = None
 
     def as_dict(self) -> dict:
-        return {"variant": self.name, "sites": list(self.sites),
-                "status": self.status, "objective": self.objective,
-                "tie_count": self.tie_count, "note": self.note}
+        result = {"variant": self.name, "sites": list(self.sites),
+                  "status": self.status, "objective": self.objective,
+                  "tie_count": self.tie_count, "note": self.note}
+        if self.spread is not None:
+            result["spread"] = self.spread
+        return result
 
 
 @dataclass
@@ -48,6 +54,8 @@ class Evaluation:
     table: pd.DataFrame
     differences: pd.DataFrame
     variants: list[VariantResult] = field(default_factory=list)
+    # М1 и М3 при остальных определениях нуждаемости: строка на определение и вариант
+    by_need: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -61,9 +69,12 @@ class Targeting:
     slow_speed: float
 
 
-def targeting_inputs(data, cfg: dict) -> Targeting | None:
-    """Подготовить блок «адресность»; None, если у города нет нуждаемости."""
-    need = need_weights(data, cfg)
+def targeting_inputs(data, cfg: dict, need: np.ndarray | None = None) -> Targeting | None:
+    """Подготовить блок «адресность»; None, если у города нет нуждаемости.
+
+    need — нуждаемость по клеткам; без неё берётся основное определение города."""
+    if need is None:
+        need = need_weights(data, cfg)
     if need is None:
         return None
     params = cfg["targeting"]
@@ -165,6 +176,41 @@ def need_weights(data, cfg: dict) -> np.ndarray | None:
     return need.to_numpy(dtype=float)
 
 
+def need_definitions(data, cfg: dict) -> dict[str, np.ndarray]:
+    """Все определения нуждаемости города по клеткам; пусто, если нуждаемости нет."""
+    city = cfg.get("city") or {}
+    groups = getattr(data, "groups", None)
+    if groups is None or "need" not in city:
+        return {}
+    found = demography_mod.need_all(groups, city["need"], city["demography"]["groups"])
+    return {name: series.to_numpy(dtype=float) for name, series in found.items()}
+
+
+def _metrics_by_need(data, cfg: dict, results: list[VariantResult]) -> pd.DataFrame:
+    """М1 и М3 при остальных определениях нуждаемости (пропозал v2, п. 3.3:
+    «Устойчивость: r = 1, r удвоенное, подгруппа 80+»).
+
+    Решения те же, меняется только то, кого считать нуждающимся при оценке. Метрики
+    группы 65+ сюда не входят: от определения N они не зависят и были бы повтором
+    главной таблицы."""
+    definitions = need_definitions(data, cfg)
+    main = ((cfg.get("city") or {}).get("need") or {}).get("main")
+    base, t_max = data.base_times, cfg["t_max_minutes"]
+    solved = [("исходная сеть", None)] + [(r.name, r.sites) for r in results if r.sites]
+    rows = []
+    for name, need in definitions.items():
+        if name == main:
+            continue
+        target = targeting_inputs(data, cfg, need)
+        for variant, sites in solved:
+            times = base if sites is None else cov.times_with(
+                base, data.site_times[list(sites)], t_max)
+            row = _targeting_row(times, base, target, cfg, _facility_times(data, sites))
+            rows.append({"need": name, "variant": variant,
+                         **{key: value for key, value in row.items() if "_65" not in key}})
+    return pd.DataFrame(rows)
+
+
 def _ahp_ranked(name: str, grades: dict, weights: dict, ties: np.ndarray, data, k: int,
                 costs: CostLog) -> VariantResult:
     """E или EN: площадки с наибольшей пригодностью при общих ограничениях."""
@@ -204,7 +250,7 @@ def _ahp_variants(data, cfg: dict, k: int, costs: CostLog, say) -> list[VariantR
         solution = solver.solve_pmedian_any(data.site_times, data.base_times, demand,
                                             data.allowed_pairs, k, "EP", cfg)
     results.append(VariantResult("EP", solution.sites, objective=solution.objective,
-                                 tie_count=solution.tie_count))
+                                 tie_count=solution.tie_count, spread=solution.spread))
     for result in results:
         say(f"вариант {result.name}", sites=list(result.sites))
     return results
@@ -231,7 +277,7 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
         solution = solver.solve_pmedian_any(site_times, base, base_weights, allowed,
                                             k, "B", cfg)
     results.append(VariantResult("B", solution.sites, objective=solution.objective,
-                                 tie_count=solution.tie_count))
+                                 tie_count=solution.tie_count, spread=solution.spread))
     say("вариант B", sites=list(solution.sites), ties=solution.tie_count)
 
     # --- BN: p-median по нуждаемости — эталон для М2 (пропозал v2, п. 3.4) ---
@@ -249,7 +295,7 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
         same_as_b = solution.sites == results[0].sites
         results.append(VariantResult(
             "BN", solution.sites, objective=solution.objective,
-            tie_count=solution.tie_count,
+            tie_count=solution.tie_count, spread=solution.spread,
             note=(("решение совпало с B; " if same_as_b else "")
                   + f"корреляция весов с B {comparison['correlation']:.4f}")))
         say("вариант BN", sites=list(solution.sites), same_as_b=same_as_b)
@@ -259,7 +305,7 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
         solution = solver.solve_max_coverage_any(site_times, base, population, allowed,
                                                  k, cfg["T_minutes"], cfg)
     results.append(VariantResult("M", solution.sites, objective=solution.objective,
-                                 tie_count=solution.tie_count))
+                                 tie_count=solution.tie_count, spread=solution.spread))
     say("вариант M", sites=list(solution.sites), ties=solution.tie_count)
 
     # --- C, D и D на 10 м: те же веса плюс скор ---
@@ -279,6 +325,7 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
             name, solution.sites,
             status="skipped_duplicate" if same_as_b else "ok",
             objective=solution.objective, tie_count=solution.tie_count,
+            spread=solution.spread,
             note=(f"решение совпало с B; корреляция весов "
                   f"{comparison['correlation']:.4f}" if same_as_b else
                   f"корреляция весов с B {comparison['correlation']:.4f}")))
@@ -296,7 +343,7 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
                                                 k, name, cfg)
         same_as_bn = solution.sites == next(r.sites for r in results if r.name == "BN")
         results.append(VariantResult(name, solution.sites, objective=solution.objective,
-                                     tie_count=solution.tie_count,
+                                     tie_count=solution.tie_count, spread=solution.spread,
                                      note="решение совпало с BN" if same_as_bn else ""))
         say(f"вариант {name}", sites=list(solution.sites), same_as_bn=same_as_bn)
 
@@ -332,7 +379,8 @@ def run_variants(data, scores: dict[str, np.ndarray], cfg: dict,
     return Evaluation(table=table,
                       differences=_differences(table, results, cfg,
                                                float(population.sum())),
-                      variants=results)
+                      variants=results,
+                      by_need=_metrics_by_need(data, cfg, results))
 
 
 def _facility_times(data, sites) -> np.ndarray:

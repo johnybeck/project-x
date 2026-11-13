@@ -376,11 +376,12 @@ def test_sensitivity_over_k_covers_both_values(city, cfg):
     assert set(table["k"]) == {1, 2}
 
 
-def test_alpha_is_skipped_outside_dev_cities(city, cfg):
-    """Подбирать α на городах проверки значило бы настраивать систему
-    на данных, по которым её оценивают (п. 7.4)."""
-    table = sens.over_alpha(city, cfg, {"text": np.zeros(4)}, is_dev_city=False)
-    assert table.iloc[0]["status"] == "пропущено"
+def test_alpha_is_shown_in_every_city(city, cfg):
+    """Пропозал v2, п. 3.4: α = 0,5 и 2 показываются во всех городах как проверка
+    устойчивости, а не как выбор. Роль города тут ни при чём."""
+    table = sens.over_alpha(city, cfg, {"text": np.zeros(4)})
+    assert set(table["variant"]) == {"C"}
+    assert set(table["alpha"]) == {cfg["alpha"], *cfg["alpha_sensitivity"]}
 
 
 def test_verdict_reports_unstable_ranking():

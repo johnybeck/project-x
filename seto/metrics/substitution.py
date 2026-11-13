@@ -13,6 +13,13 @@
 Решения B′ зависят только от зашумлённого P, а не от того, как определена
 нуждаемость, — поэтому они считаются один раз на k и оцениваются по всем
 определениям N (основное и проверки устойчивости).
+
+Порог шума отвечает на вопрос «не дрожит ли само решение B». Он не ловит другого:
+скор меняет вес клетки до двух раз, и даже скор без знания о городе сдвигает решение, а
+иногда попадает в площадку BN. Поэтому рядом с захватом считается сравнение с
+перестановкой (решение 10.11, PROPOSAL_CHANGES п. 16): те же ответы модели розданы
+клеткам с жителями наугад, решатель и вес спроса те же. Захват называется «выше
+случайного», только если не больше `permutation_level` перестановок дают захват не ниже.
 """
 from __future__ import annotations
 
@@ -21,6 +28,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from ..scoring import weights as weights_mod
 from ..sites import feasible as sites_mod
 from ..variants import solve as solver
 from .coverage import times_with
@@ -66,6 +74,85 @@ def noise_draws(data, cfg: dict, k: int, draws: int, amplitude: float,
                                             data.allowed_pairs, k, "B′", cfg)
         result.sites.append(tuple(solution.sites))
     return result
+
+
+def permutation_draws(data, cfg: dict, k: int, scores: np.ndarray, draws: int,
+                      seed) -> list[tuple[int, ...]]:
+    """Решения при перемешанных ответах модели: тот же решатель, тот же вес спроса.
+
+    Перемешиваются только клетки с жителями. У пустой клетки вес спроса ноль при любом
+    скоре, а её ответ почти всегда «не определить»: отдай его клетке с жителями — и
+    набор ответов станет ровнее настоящего, а проверка мягче. Набор значений по всем
+    клеткам при этом тот же, поэтому нормализация скора не меняется."""
+    population = np.asarray(data.population, dtype=float)
+    live = population > 0
+    values = np.asarray(scores, dtype=float)
+    rng = np.random.default_rng(seed)
+    found = []
+    for _ in range(draws):
+        shuffled = values.copy()
+        shuffled[live] = rng.permutation(values[live])
+        weights = weights_mod.demand(population, shuffled, cfg["alpha"])
+        solution = solver.solve_pmedian_any(data.site_times, data.base_times, weights,
+                                            data.allowed_pairs, k, "перестановка", cfg)
+        found.append(tuple(solution.sites))
+    return found
+
+
+def share_not_below(gain: float, gains: np.ndarray, scale: float) -> float:
+    """Доля перестановок, отыгравших не меньше варианта. Сравнение с допуском: суммы
+    человеко-минут одного и того же набора площадок не должны разойтись на шуме
+    округления."""
+    tolerance = 1e-9 * max(1.0, abs(scale))
+    return float((np.asarray(gains, dtype=float) >= gain - tolerance).mean())
+
+
+def with_permutations(table: pd.DataFrame, data, needs: dict[str, np.ndarray], cfg: dict,
+                      variants: dict[int, dict], scores: dict[str, np.ndarray],
+                      logger=None) -> tuple[pd.DataFrame, dict]:
+    """Дописать в таблицу М2 сравнение с перестановкой ответов модели.
+
+    scores — скоры по именам вариантов (C, D, D10). Для каждого варианта и k решения
+    перестановок считаются один раз и оцениваются по всем определениям N, как B′.
+    Колонки: `perm_share_X` — доля перестановок с захватом не ниже, чем у X;
+    `above_chance_X` — правило чтения, заполняется там, где захват показывается.
+    Возвращает таблицу и решения перестановок {k: {вариант: наборы}}."""
+    say = logger.info if logger else (lambda *a, **kw: None)
+    params = cfg["m2"]
+    draws = params.get("permutation_draws", 0)
+    if not draws or not scores or table.empty:
+        return table, {}
+    level, t_max = params["permutation_level"], cfg["t_max_minutes"]
+    table = table.copy()
+    for name in scores:
+        table[f"perm_share_{name}"] = np.nan
+        table[f"above_chance_{name}"] = None
+    found: dict = {}
+    for requested in sorted(table["k"].unique()):
+        rows = table.index[table["k"] == requested]
+        k = int(table.at[rows[0], "k_used"])
+        found[int(requested)] = {}
+        for position, (name, values) in enumerate(scores.items()):
+            chosen = (variants.get(requested) or {}).get(name)
+            if not chosen:
+                continue
+            shuffled = permutation_draws(data, cfg, k, values, draws,
+                                         [cfg["seed"], 2, int(requested), position])
+            found[int(requested)][name] = [list(sites) for sites in shuffled]
+            for index in rows:
+                need = needs[table.at[index, "need"]]
+                z_b = float(table.at[index, "Z_N_B"])
+                gain = z_b - need_time(data.site_times, data.base_times, chosen, need, t_max)
+                gains = [z_b - need_time(data.site_times, data.base_times, sites, need, t_max)
+                         for sites in shuffled]
+                share = share_not_below(gain, gains, z_b)
+                table.at[index, f"perm_share_{name}"] = share
+                shown = (f"capture_{name}" in table.columns
+                         and pd.notna(table.at[index, f"capture_{name}"]))
+                table.at[index, f"above_chance_{name}"] = bool(share <= level) if shown else None
+            say("М2, перестановки", variant=name, k=int(requested),
+                distinct=len(set(shuffled)))
+    return table, found
 
 
 def study(data, needs: dict[str, np.ndarray], cfg: dict, k_values: list[int],

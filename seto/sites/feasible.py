@@ -16,6 +16,10 @@ import numpy as np
 import pandas as pd
 
 
+# здания с жилым или общественным типом: правило по умолчанию
+_TYPED = ["residential_share", "public_share"]
+
+
 class ConstraintViolation(ValueError):
     """Набор площадок нарушает общие ограничения."""
 
@@ -48,14 +52,14 @@ def select(features: pd.DataFrame, rule: dict, attached: np.ndarray,
     # не проставлен, это занижает застройку в разы: в Люцерне тип есть у
     # 26 % зданий против 56 % в Москве, и город выглядел бы пустым. Тогда в
     # конфиге города берётся built_share — все здания без разбора типа.
-    columns = rule.get("built_from", ["residential_share", "public_share"])
+    columns = rule.get("built_from", _TYPED)
     missing = [c for c in columns if c not in features]
     if missing:
         raise KeyError(f"в признаках нет колонок {missing} для built_from")
     built = sum(features[c].to_numpy() for c in columns)
 
     checks = {
-        "мало жилой и общественной застройки": built >= rule["min_built_area_share"],
+        _built_reason(columns): built >= rule["min_built_area_share"],
         "вода": features["water_share"].to_numpy() < rule.get("max_water_share", 0.5),
         "парк или зелень": (features["green_share"].to_numpy()
                             < rule.get("max_green_share", 0.5)),
@@ -81,6 +85,15 @@ def select(features: pd.DataFrame, rule: dict, attached: np.ndarray,
 
     return FeasibleSites(index=np.flatnonzero(keep), reasons=reasons,
                          total_cells=size)
+
+
+def _built_reason(columns: list[str]) -> str:
+    """Как назвать отсев по застройке: в отчёте должно быть видно, какие здания считались."""
+    if list(columns) == _TYPED:
+        return "мало жилой и общественной застройки"
+    if list(columns) == ["built_share"]:
+        return "мало застройки (все здания)"
+    return f"мало застройки ({', '.join(columns)})"
 
 
 def pair_allowed(distance_matrix: np.ndarray, min_dist_m: float) -> np.ndarray:

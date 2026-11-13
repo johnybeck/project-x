@@ -225,7 +225,7 @@ def cmd_prepare_city(args: argparse.Namespace) -> int:
     import json
 
     from .costs.timer import CostLog
-    from .experiment.prepare import prepare_city, use_population_check
+    from .experiment.prepare import prepare_city, use_population_check, use_site_check
 
     cfg = config_mod.load(args.city)
     if args.snapshot_date:
@@ -234,12 +234,19 @@ def cmd_prepare_city(args: argparse.Namespace) -> int:
         print("не задан snapshot_date: укажи --snapshot-date или впиши в config",
               file=sys.stderr)
         return 1
-    if args.population_check:
-        try:
+    if args.population_check and args.site_check:
+        # проверки объявлены по одной: их сочетание в протокол не входит
+        print("за один запуск — одна проверка: --population-check или --site-check",
+              file=sys.stderr)
+        return 1
+    try:
+        if args.population_check:
             use_population_check(cfg, args.population_check)
-        except config_mod.ConfigError as error:
-            print(error, file=sys.stderr)
-            return 1
+        if args.site_check:
+            use_site_check(cfg, args.site_check)
+    except config_mod.ConfigError as error:
+        print(error, file=sys.stderr)
+        return 1
 
     costs = CostLog(mode=args.mode)
     with Run.start(args.city, "prepare-city", cfg) as run:
@@ -446,6 +453,27 @@ def _refused(protocol: Path, name: str, cfg: dict, runs: tuple[Path, ...] = ()) 
     return bool(problems)
 
 
+def _protocol_gate(args: argparse.Namespace, cfg: dict,
+                   folders: tuple[Path, ...]) -> tuple[Path | None, int | None]:
+    """Сверка с протоколом перед шагом, который читает готовые папки.
+
+    Возвращает (путь протокола, код отказа). Без `--protocol` шаг считает как раньше —
+    это разработка; у города с ролью test протокол обязателен. Одна функция на все
+    шаги: число, которое идёт в выводы, не должно зависеть от того, какой командой
+    оно посчитано."""
+    from .experiment.runner import ProtocolRequired, guard_test_city
+
+    protocol = Path(args.protocol) if getattr(args, "protocol", None) else None
+    try:
+        guard_test_city(cfg, protocol)
+    except ProtocolRequired as error:
+        print(f"запуск запрещён: {error}", file=sys.stderr)
+        return protocol, 3
+    if protocol is not None and _refused(protocol, cfg["city"]["name"], cfg, folders):
+        return protocol, 3
+    return protocol, None
+
+
 def _manifest_hash(run_dir: Path) -> str:
     from .run import sha256_of
 
@@ -460,6 +488,7 @@ def _load_city_data(run_dir: Path):
     import pandas as pd
 
     from .experiment.prepare import CityData
+    from .variants import ahp as ahp_mod
 
     times = np.load(run_dir / "times.npz")
     features = pd.read_parquet(run_dir / "cell_features.parquet")
@@ -484,6 +513,7 @@ def _load_city_data(run_dir: Path):
         base_times=times["base"], clinic_times=times["clinics"],
         site_times=times["sites"], site_index=times["site_index"],
         allowed_pairs=times["allowed"], report={},
+        ahp_options=ahp_mod.read_options(times),
         groups=groups if len(groups.columns) else None,
         districts=features["district"] if "district" in features else None,
         # прогоны старше слоёв AHP: у них варианты E, EN, EP будут «нет данных»
@@ -498,6 +528,7 @@ def cmd_step2(args: argparse.Namespace) -> int:
     from .costs.timer import CostLog
     from .experiment.runner import ProtocolRequired, guard_test_city
     from .experiment.step2 import run_step2
+    from .scoring import rules as rules_mod
 
     cfg = config_mod.load(args.city)
     protocol = Path(args.protocol) if args.protocol else None
@@ -511,16 +542,32 @@ def cmd_step2(args: argparse.Namespace) -> int:
     if protocol is not None and _refused(protocol, args.city, cfg,
                                          tuple(p for p in (prepared, scored) if p)):
         return 3
+    rule, command = None, "step2"
+    if args.score_rule:
+        if not scored:
+            print("--score-rule пересчитывает скор из ответов модели: нужен --scores",
+                  file=sys.stderr)
+            return 1
+        try:
+            rule = rules_mod.for_check(cfg, args.score_rule)
+        except ValueError as error:
+            print(f"правило не подходит: {error}", file=sys.stderr)
+            return 1
+        # сверка с протоколом уже пройдена на основном конфиге; дальше в папку
+        # прогона пишется, по какому правилу она посчитана
+        cfg = {**cfg, "score_rule": args.score_rule,
+               "score_rule_check_of": cfg["score_rule"]}
+        command = f"step2-{args.score_rule}"
     data = _load_city_data(prepared)
     scores = None
     if scored:
         try:
-            scores = _load_scores(scored, data.features["cell_id"].tolist())
+            scores = _load_scores(scored, data.features["cell_id"].tolist(), rule)
         except ValueError as error:
             print(f"скоры не подходят: {error}", file=sys.stderr)
             return 1
     costs = CostLog()
-    with Run.start(args.city, "step2", cfg) as run:
+    with Run.start(args.city, command, cfg) as run:
         logger = RunLogger(run.run_id, run.dir / "log.jsonl")
         for name in ("manifest.json", "times.npz", "cell_features.parquet"):
             run.record_input(prepared / name)
@@ -537,10 +584,16 @@ def cmd_step2(args: argparse.Namespace) -> int:
     print(pd.read_csv(paths["coverage_by_k"]).to_string(index=False, **number))
     table = pd.read_csv(paths["m2"])
     columns = ["need", "k", "same_sites", "ceiling_per_1000", "noise_per_1000",
-               "above_noise", *[name for name in ("capture_C", "capture_D", "capture_D10")
-                                if name in table.columns]]
+               "above_noise",
+               *[name for name in ("capture_C", "capture_D", "capture_D10",
+                                   "perm_share_C", "perm_share_D", "perm_share_D10")
+                 if name in table.columns]]
     print()
     print(table[columns].to_string(index=False, **number))
+    if args.score_rule:
+        print(f"\nправило перевода: {args.score_rule} — проверка, "
+              f"{cfg['score_rule_checks'][args.score_rule]}; основное — "
+              f"{cfg['score_rule_check_of']}")
     print(f"\nрезультаты: {run.dir}")
     return 0
 
@@ -557,6 +610,10 @@ def cmd_compare_population(args: argparse.Namespace) -> int:
     if len(versions) < 2:
         print("нужны хотя бы две версии: основная и проверка", file=sys.stderr)
         return 1
+    protocol, refusal = _protocol_gate(
+        args, cfg, tuple(folder for v in versions for folder in (v.prepared, v.step2)))
+    if refusal:
+        return refusal
     try:
         checks.check_same_task(versions)
     except ValueError as error:
@@ -568,6 +625,8 @@ def cmd_compare_population(args: argparse.Namespace) -> int:
                                   checks.main_need(versions[0].features(), cfg),
                                   cfg["T_minutes"], cfg["t_max_minutes"])
     with Run.start(args.city, "compare-population", cfg) as run:
+        if protocol is not None:
+            run.record_input(protocol)
         for version in versions:
             for folder in (version.prepared, version.step2):
                 run.record_input(folder / "manifest.json")
@@ -586,25 +645,79 @@ def cmd_compare_population(args: argparse.Namespace) -> int:
 
 def cmd_ahp_stability(args: argparse.Namespace) -> int:
     """Устойчивость E: Монте-Карло по спорным выборам (пропозал v2, п. 3.6)."""
-    from .experiment.ahp_stability import study
-    from .experiment.runner import guard_test_city
+    from .experiment.ahp_stability import by_option, study
 
     cfg = config_mod.load(args.city)
-    guard_test_city(cfg, None)
     prepared = Path(args.prepared_run)
+    protocol, refusal = _protocol_gate(args, cfg, (prepared,))
+    if refusal:
+        return refusal
     data = _load_city_data(prepared)
     with Run.start(args.city, "ahp-stability", cfg) as run:
         for name in ("manifest.json", "times.npz", "cell_features.parquet"):
             run.record_input(prepared / name)
+        if protocol is not None:
+            run.record_input(protocol)
         draws, summary, ties = study(data, cfg)
+        options = by_option(draws)
         for table, name in ((draws, "ahp_draws.csv"), (summary, "ahp_stability.csv"),
-                            (ties, "ahp_ties.csv")):
+                            (ties, "ahp_ties.csv"), (options, "ahp_options.csv")):
             table.to_csv(run.dir / name, index=False, encoding="utf-8")
             run.record_output(run.dir / name)
 
     print(summary.round(3).to_string(index=False))
     print()
+    print(options.round(3).to_string(index=False))
+    print()
     print(ties.to_string(index=False))
+    print(f"\nрезультаты: {run.dir}")
+    return 0
+
+
+def cmd_evaluate_homes(args: argparse.Namespace) -> int:
+    """Проверка «оценка от домов»: те же решения, время — от жилых домов кадастра
+    (решение 10.11, PROPOSAL_CHANGES п. 17)."""
+    import pandas as pd
+
+    from .experiment import homes as homes_mod
+
+    cfg = config_mod.load(args.city)
+    prepared, solved = Path(args.prepared_run), Path(args.solutions_run)
+    protocol, refusal = _protocol_gate(args, cfg, tuple({prepared, solved}))
+    if refusal:
+        return refusal
+    if not (cfg["city"].get("buildings") or {}).get("evaluate_from_homes"):
+        # проверка объявляется в конфиге города: по нему она попадает в протокол
+        print(f"{args.city}: нет данных — у города нет зданий с квартирами или проверка "
+              "не объявлена (buildings.evaluate_from_homes)", file=sys.stderr)
+        return 1
+    data = _load_city_data(prepared)
+    solutions = homes_mod.read_solutions(solved / "solutions.json", cfg["k"])
+    with Run.start(args.city, "evaluate-homes", cfg) as run:
+        logger = RunLogger(run.run_id, run.dir / "log.jsonl")
+        for folder in (prepared, solved):
+            run.record_input(folder / "manifest.json")
+        run.record_input(solved / "solutions.json")
+        if protocol is not None:
+            run.record_input(protocol)
+        try:
+            paths = homes_mod.run(args.city, cfg, data, solutions, run.dir, logger)
+        except (ValueError, FileNotFoundError) as error:
+            logger.close()
+            print(f"оценка от домов не посчитана: {error}", file=sys.stderr)
+            return 1
+        for path in paths.values():
+            run.record_output(path)
+        logger.close()
+
+    number = {"float_format": lambda v: f"{v:.2f}"}
+    print()
+    print(Path(paths["homes_base"]).read_text(encoding="utf-8"))
+    table = pd.read_csv(paths["homes_variants"])
+    print(table.drop(columns=["sites"]).to_string(index=False, **number))
+    print()
+    print(pd.read_csv(paths["homes_differences"]).drop(columns=["meaning"])
+          .to_string(index=False, **number))
     print(f"\nрезультаты: {run.dir}")
     return 0
 
@@ -620,14 +733,16 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
 
     cfg = config_mod.load(args.city)
     run_dir = Path(args.run_dir)
+    _, refusal = _protocol_gate(args, cfg, (run_dir,))
+    if refusal:
+        return refusal
     data = _load_city_data(run_dir)
     scores = _load_scores(run_dir)
     solutions = _load_solutions(run_dir)
 
     thresholds = sens.over_thresholds(data, solutions, cfg)
     by_k = sens.over_k(data, cfg, scores)
-    by_alpha = sens.over_alpha(data, cfg, scores,
-                               cfg["city"].get("role") == "dev")
+    by_alpha = sens.over_alpha(data, cfg, scores)
     thresholds.to_csv(run_dir / "sensitivity_T.csv", index=False, encoding="utf-8")
     by_k.to_csv(run_dir / "sensitivity_k.csv", index=False, encoding="utf-8")
     by_alpha.to_csv(run_dir / "sensitivity_alpha.csv", index=False, encoding="utf-8")
@@ -820,6 +935,10 @@ def cmd_m4(args: argparse.Namespace) -> int:
     if args.snapshot_date:
         cfg["snapshot_date"] = args.snapshot_date
     prepared = Path(args.prepared_run)
+    scored = Path(args.scores).parent
+    _, refusal = _protocol_gate(args, cfg, tuple({prepared, scored}))
+    if refusal:
+        return refusal
     rules = cfg["city"]["income"]
     raw = config_mod.raw_dir(cfg, args.city, cfg["snapshot_date"])
     income = income_mod.read(raw / cfg["city"]["sources"]["tables"][rules["table"]]["file"],
@@ -858,12 +977,17 @@ def cmd_profile_cities(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_scores(run_dir: Path, cell_ids: list[str] | None = None) -> dict:
+def _load_scores(run_dir: Path, cell_ids: list[str] | None = None,
+                 rule: dict | None = None) -> dict:
     """Скоры прогона. Если заданы cell_ids, порядок клеток обязан совпасть: скор идёт
-    в вес спроса по позиции, и чужой порядок молча раздал бы его не тем клеткам."""
+    в вес спроса по позиции, и чужой порядок молча раздал бы его не тем клеткам.
+
+    rule — правило-проверка: скор пересчитывается из сохранённых ответов модели, а
+    не берётся из колонки `score`, посчитанной по основному правилу."""
     import pandas as pd
 
     from .experiment.evaluate import SCORED_VARIANTS
+    from .scoring import rules as rules_mod
 
     scores = {}
     for key in SCORED_VARIANTS:
@@ -872,7 +996,8 @@ def _load_scores(run_dir: Path, cell_ids: list[str] | None = None) -> dict:
             frame = pd.read_parquet(path)
             if cell_ids is not None and frame["cell_id"].tolist() != cell_ids:
                 raise ValueError(f"в {path.name} другие клетки или другой порядок")
-            scores[key] = frame["score"].to_numpy()
+            scores[key] = (frame["score"] if rule is None
+                           else rules_mod.score_filled(frame, rule)).to_numpy()
     return scores
 
 
@@ -930,6 +1055,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="режим учёта затрат (п. 14)")
     p.add_argument("--population-check", default=None,
                    help="проверка населения из population.checks вместо основной раскладки")
+    p.add_argument("--site-check", default=None,
+                   help="проверка правила площадки из feasible_site.checks вместо основного")
     p.set_defaults(func=cmd_prepare_city)
 
     p = sub.add_parser("run-city", help="сквозной прогон города до отчёта")
@@ -982,6 +1109,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("sensitivity", help="устойчивость к T, k, alpha")
     p.add_argument("city")
     p.add_argument("run_dir")
+    p.add_argument("--protocol", default=None,
+                   help="protocol.json: сверка кода, правил, данных и папки прогона")
     p.set_defaults(func=cmd_sensitivity)
 
     p = sub.add_parser("package-results", help="пакет результатов (п. 18.5)")
@@ -996,6 +1125,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prepared_run", help="папка прогона prepare-city")
     p.add_argument("--scores", default=None,
                    help="папка прогона со скорами модели: посчитать C, D и их захват")
+    p.add_argument("--score-rule", default=None,
+                   help="правило-проверка из score_rule_checks: скор пересчитывается "
+                        "из ответов модели в --scores")
     p.add_argument("--protocol", default=None,
                    help="protocol.json: сверка кода, правил, данных и готовых папок")
     p.set_defaults(func=cmd_step2)
@@ -1006,11 +1138,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", nargs=3, action="append", required=True,
                    metavar=("ИМЯ", "ПОДГОТОВКА", "STEP2"),
                    help="первая — основная версия; папки prepare-city (или run-city) и step2")
+    p.add_argument("--protocol", default=None,
+                   help="protocol.json: сверка кода, правил, данных и всех папок версий")
     p.set_defaults(func=cmd_compare_population)
+
+    p = sub.add_parser("evaluate-homes",
+                       help="проверка: те же решения, время от жилых домов кадастра")
+    p.add_argument("city")
+    p.add_argument("prepared_run", help="папка подготовки города (prepare-city или run-city)")
+    p.add_argument("solutions_run", help="папка с solutions.json (step2 или run-city)")
+    p.add_argument("--protocol", default=None,
+                   help="protocol.json: сверка кода, правил, данных и готовых папок")
+    p.set_defaults(func=cmd_evaluate_homes)
 
     p = sub.add_parser("ahp-stability", help="устойчивость E: Монте-Карло")
     p.add_argument("city")
     p.add_argument("prepared_run", help="папка прогона prepare-city")
+    p.add_argument("--protocol", default=None,
+                   help="protocol.json: сверка кода, правил, данных и папки подготовки")
     p.set_defaults(func=cmd_ahp_stability)
 
     p = sub.add_parser("acquire-imagery", help="снимки по клеткам")
@@ -1054,6 +1199,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prepared_run", help="папка прогона prepare-city")
     p.add_argument("scores", help="файл scores_image.parquet или scores_text.parquet")
     p.add_argument("--snapshot-date", default=None)
+    p.add_argument("--protocol", default=None,
+                   help="protocol.json: сверка кода, правил, данных и готовых папок")
     p.set_defaults(func=cmd_m4)
 
     p = sub.add_parser("profile-cities", help="профиль городов-кандидатов")

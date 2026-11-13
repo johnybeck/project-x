@@ -219,7 +219,18 @@ def _city(**extra):
                              [40.0, 40.0, 5.0, 5.0]]),
         site_index=np.array([0, 1, 2]), allowed_pairs=_all_allowed(3),
         road_times=np.array([9.0, 8.0, 1.0, 1.0]), dense_times=np.array([0.0, 0.0, 9.0, 9.0]),
-        **extra)
+        **{"ahp_options": _options(), **extra})
+
+
+def _options():
+    """Слои при других порогах: основной порог повторяет основной слой, остальные
+    меняют порядок площадок по критерию."""
+    return {"roads": {"primary": np.array([1.0, 9.0, 8.0, 8.0]),
+                      "secondary": np.array([9.0, 8.0, 1.0, 1.0]),
+                      "tertiary": np.array([2.0, 2.0, 2.0, 2.0])},
+            "dense": {"0.10": np.array([9.0, 0.0, 9.0, 9.0]),
+                      "0.25": np.array([0.0, 0.0, 9.0, 9.0]),
+                      "0.50": np.array([0.0, 0.0, 0.0, 9.0])}}
 
 
 NEED_CITY = {"role": "dev", "name": "test",
@@ -335,6 +346,103 @@ def test_shares_are_parts_of_one_whole(cfg):
     assert (shares >= 0).all(axis=None)
     assert (shares.drop(columns="share_joint").sum(axis=1) + summary["share_joint"]
             >= 1 - 1e-9).all()
+
+
+def test_thresholds_are_drawn_in_every_repeat(cfg):
+    """Наши пороги — такой же спорный выбор, как схема классов (PROPOSAL_CHANGES п. 10)."""
+    draws = stability.study(_city(groups=_groups()), _stability_cfg(cfg, 200))[0]
+    assert set(draws["dense"]) == {"0.10", "0.25", "0.50"}
+    assert set(draws["roads"]) == {"primary", "secondary", "tertiary"}
+
+
+def test_thresholds_get_their_own_share_of_the_spread(cfg):
+    summary = stability.study(_city(groups=_groups()), _stability_cfg(cfg, 200))[1]
+    assert {"share_dense", "share_roads"} <= set(summary.columns)
+    # при k = 1 площадку решает порог дорог: у «primary» лучшая площадка другая
+    assert summary.loc[summary["k"] == 1, "share_roads"].iloc[0] > 0
+
+
+def _main_thresholds_only(cfg, draws=60):
+    params = {**RULES["stability"], "draws": draws, "dense_shares": [RULES["dense_share"]],
+              "main_roads": {"secondary": RULES["stability"]["main_roads"]["secondary"]}}
+    return {**cfg, "ahp": {**RULES, "stability": params}}
+
+
+def _no_thresholds(cfg, draws=60):
+    params = {key: value for key, value in RULES["stability"].items()
+              if key not in ("dense_shares", "main_roads")}
+    return {**cfg, "ahp": {**RULES, "stability": {**params, "draws": draws}}}
+
+
+def test_main_thresholds_alone_repeat_the_draws_without_thresholds(cfg):
+    """Порог не трогает выборы пропозала: с одним основным порогом повторы те же, что
+    были до включения порогов, — та же схема, веса, ничьи и то же решение."""
+    city = _city(groups=_groups())
+    with_main = stability.study(city, _main_thresholds_only(cfg))[0]
+    city.ahp_options = None
+    without = stability.study(city, _no_thresholds(cfg))[0]
+    same = ["draw", "k", "scheme", "method", "ties", "sites", "dCov"]
+    pd.testing.assert_frame_equal(with_main[same], without[same])
+    assert set(without["dense"]) == set(without["roads"]) == {"main"}
+
+
+def test_thresholds_without_layers_are_an_error(cfg):
+    """Молча взять основной слой значило бы выдать узкий разброс E за полный."""
+    city = _city(groups=_groups())
+    city.ahp_options = None
+    with pytest.raises(ValueError, match="prepare-city"):
+        stability.study(city, _stability_cfg(cfg))
+
+
+def test_spread_by_option_has_a_row_per_k_and_option(cfg):
+    draws = stability.study(_city(groups=_groups()), _stability_cfg(cfg, 200))[0]
+    table = stability.by_option(draws)
+    assert len(table) == 2 * (3 + 3)
+    assert table.groupby(["k", "source"])["draws"].sum().tolist() == [200] * 4
+
+
+def test_option_layers_survive_saving(tmp_path):
+    options = _options()
+    np.savez(tmp_path / "times.npz", base=np.zeros(4),
+             **{ahp.option_key(criterion, name): values
+                for criterion, layers in options.items() for name, values in layers.items()})
+    found = ahp.read_options(np.load(tmp_path / "times.npz"))
+    assert sorted(found["dense"]) == ["0.10", "0.25", "0.50"]
+    assert found["roads"]["primary"].tolist() == options["roads"]["primary"].tolist()
+
+
+def test_old_preparation_has_no_option_layers(tmp_path):
+    np.savez(tmp_path / "times.npz", base=np.zeros(4), to_roads=np.zeros(4))
+    assert ahp.read_options(np.load(tmp_path / "times.npz")) is None
+
+
+def test_share_name_keeps_two_digits():
+    assert [ahp.share_name(value) for value in (0.1, 0.25, 0.5)] == ["0.10", "0.25", "0.50"]
+
+
+def test_option_equal_to_the_main_threshold_is_the_main_layer():
+    """Основной E и его повтор в Монте-Карло считаются по одному и тому же слою."""
+    from seto.experiment.prepare import ahp_option_layers
+
+    lines, graph = _road_graph()
+    cells = matrix_mod.snap(graph, np.array([[0.0, 75.0], [750.0, 0.0], [1500.0, 0.0]]),
+                            300, 75)
+    population = np.array([10.0, 500.0, 20.0])
+    roads_main = np.array([11.0, 0.0, 0.0])
+    dense_main = np.array([7.0, 0.0, 7.0])
+    cfg = {"snap_max_m": 300, "t_max_minutes": 60,
+           "osm": {"main_roads": ["primary"]},
+           "ahp": {"dense_share": 0.25,
+                   "stability": {"dense_shares": [0.25, 1.0],
+                                 "main_roads": {"same": ["primary"],
+                                                "wider": ["primary", "residential"]}}}}
+    found = ahp_option_layers(graph, lines, cells, population, cfg, roads_main, dense_main)
+    assert found["roads"]["same"] is roads_main
+    assert found["dense"]["0.25"] is dense_main
+    # шире набор дорог — первая клетка стоит у «главной» улицы, остаётся минута подхода
+    assert found["roads"]["wider"].round(6).tolist() == [1.0, 0.0, 0.0]
+    # плотными считаются все клетки с жителями — до плотного района ноль отовсюду
+    assert found["dense"]["1.00"].tolist() == [0.0, 0.0, 0.0]
 
 
 def test_one_source_explains_a_split_by_itself():
